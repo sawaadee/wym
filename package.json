@@ -1,6 +1,6 @@
 {
   "name": "wym",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "description": "End-to-end encrypted file sharing in the browser where neither side learns the other's IP address.",
   "type": "module",

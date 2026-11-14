@@ -1852,14 +1852,19 @@ function attachNodeDispatch (node) {
 // at once. A sender whose link is already out first reconnects to the same gateway, which keeps the
 // address and the link; only if that does not help does it move, and then shows the new link.
 // A recipient's address is in no link, so it moves at once and reopens its link to the sender.
-// A node switches at most HEALTH_SWITCH_LIMIT times, so a wider outage cannot cause endless moves.
+// A node changes gateway at most HEALTH_SWITCH_LIMIT times within HEALTH_SWITCH_WINDOW_MS, so a
+// wider outage cannot cause endless moves, while a tab left open for hours can still recover later.
 const HEALTH_SWITCH_LIMIT = 3
+const HEALTH_SWITCH_WINDOW_MS = 10 * 60 * 1000
 function handleNodeHealth (node, health) {
   if (health.state !== 'degraded' || node.state !== 'connected') return
-  if (node.healthSwitches >= HEALTH_SWITCH_LIMIT) {
-    diagnostics.warn('nym', 'incoming messages are still not arriving after ' + HEALTH_SWITCH_LIMIT + ' gateway changes; staying put', { acknowledgementsPerPacketOut: health.acknowledgementReturn })
+  const now = Date.now()
+  node.healthSwitchTimes = (node.healthSwitchTimes ?? []).filter(time => now - time < HEALTH_SWITCH_WINDOW_MS)
+  if (node.healthSwitchTimes.length >= HEALTH_SWITCH_LIMIT) {
+    diagnostics.warn('nym', 'incoming messages are still not arriving after ' + HEALTH_SWITCH_LIMIT + ' gateway changes in ' + HEALTH_SWITCH_WINDOW_MS / 60000 + ' minutes; staying put for now', { acknowledgementsPerPacketOut: health.acknowledgementReturn })
     return
   }
+  node.healthSwitchTimes.push(now)
   node.healthSwitches += 1
   const linkShared = sendSession.node === node && Boolean(sendSession.linkFields)
   const keepAddress = linkShared && !node.healthSameGatewayTried
@@ -2212,7 +2217,7 @@ function handleSenderReconnected (sameAddress) {
   elementById('qr-image').classList.add('hidden')
   setButtonContent(elementById('toggle-qr'), 'qr-code', 'Show QR code')
   diagnostics.warn('send', 'share link replaced after the Nym address changed', { linkCharacters: shareLink.length })
-  showShareNotice('Your Nym connection was replaced and the old link no longer works. Send this new link instead.')
+  showShareNotice('This page moved to another Nym gateway, so the old link no longer works. Send this new link instead.')
 }
 
 function showShareNotice (text) {
