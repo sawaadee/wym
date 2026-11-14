@@ -96,7 +96,7 @@ const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
 // Fault injection for testing recovery, enabled only when the page is opened with ?faults=1.
 // It adds window.nymShareFaults; nothing else changes.
 const FAULT_INJECTION_ENABLED = new URLSearchParams(location.search).get('faults') === '1'
-const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0, stallConnects: 0 }
+const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0, stallConnects: 0, rememberFaultFailures: false }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -497,6 +497,10 @@ const HEALTH_PROBE_MAX_MS = 3000
 const HEALTH_STEADY_ACK_MINIMUM = 0.6
 const HEALTH_CONFIRMING_WINDOWS = 2
 const HEALTH_MIN_PACKETS_PER_WINDOW = 200
+// Acknowledgements trail their packets by about a second, and right after a connect the first check
+// already covers the incoming path, so ongoing checks ignore samples that began within this long
+// of the latest connect.
+const HEALTH_SETTLE_MS = 10000
 // A healthy connect makes visible progress every 1 to 2 s: the registration connection opens 1.4
 // to 3 s after the client starts and closes about a second later, the working connection opens
 // about 1.5 s after that, and the client reports connected about 0.8 s later (gateway test). A
@@ -627,6 +631,40 @@ function loadGatewayDirectory () {
   return gatewayDirectory.promise
 }
 
+// Gateways that failed the health check or stalled while connecting in this browser are skipped for
+// GATEWAY_FAILURE_MEMORY_MS. In testing, the same gateway failed every time it was drawn, across two
+// days, while its published score moved from 0.94 to 0.95. Only failures are remembered: returning
+// to a gateway that worked would tie visits together, while leaving a few gateways out of a random
+// draw does not. Failures caused by the ?faults=1 controls are not remembered unless asked for.
+const GATEWAY_FAILURE_MEMORY_KEY = 'nym-share-failed-gateways'
+const GATEWAY_FAILURE_MEMORY_MS = 24 * 60 * 60 * 1000
+const GATEWAY_FAILURE_MEMORY_LIMIT = 50
+
+/** Identity -> time of failure, for failures within GATEWAY_FAILURE_MEMORY_MS. */
+function readGatewayFailures () {
+  try {
+    const stored = JSON.parse(localStorage.getItem(GATEWAY_FAILURE_MEMORY_KEY) ?? '{}') ?? {}
+    const now = Date.now()
+    return Object.fromEntries(Object.entries(stored).filter(([identity, failedAt]) => typeof identity === 'string' && Number.isFinite(failedAt) && now - failedAt < GATEWAY_FAILURE_MEMORY_MS))
+  } catch (error) {
+    return {}
+  }
+}
+
+function rememberGatewayFailure (gateway, reason) {
+  if (!gateway?.identity) return
+  const failures = readGatewayFailures()
+  failures[gateway.identity] = Date.now()
+  // Keep the most recent failures only, so the list cannot grow without bound.
+  const kept = Object.entries(failures).sort((left, right) => right[1] - left[1]).slice(0, GATEWAY_FAILURE_MEMORY_LIMIT)
+  try {
+    localStorage.setItem(GATEWAY_FAILURE_MEMORY_KEY, JSON.stringify(Object.fromEntries(kept)))
+  } catch (error) {
+    // Storage can be unavailable (private modes); the gateway is still skipped for this page.
+  }
+  diagnostics.info('nym', 'gateway remembered as failed for ' + GATEWAY_FAILURE_MEMORY_MS / 3600000 + ' hours', Object.assign({ reason, rememberedFailures: kept.length }, describeGateway(gateway)))
+}
+
 /** Uniform random integer in [0, upperBound) from the browser's cryptographic generator. */
 function randomIndex (upperBound) {
   const limit = Math.floor(0x100000000 / upperBound) * upperBound
@@ -642,9 +680,12 @@ function randomIndex (upperBound) {
  * not tried yet, and marks it tried. Returns { identity, performance } or null, in which case the
  * Nym client chooses by itself. The bounds let the gateway test sample particular score bands.
  */
-async function chooseGateway ({ minimumPerformance = GATEWAY_MINIMUM_PERFORMANCE, maximumPerformance = Infinity } = {}) {
+async function chooseGateway ({ minimumPerformance = GATEWAY_MINIMUM_PERFORMANCE, maximumPerformance = Infinity, skipRecentFailures = true } = {}) {
   const gateways = await loadGatewayDirectory()
-  const candidates = gateways.filter(gateway => gateway.performance >= minimumPerformance && gateway.performance < maximumPerformance && !gatewayDirectory.triedThisPage.has(gateway.identity))
+  const recentFailures = skipRecentFailures ? readGatewayFailures() : {}
+  const inBand = gateways.filter(gateway => gateway.performance >= minimumPerformance && gateway.performance < maximumPerformance && !gatewayDirectory.triedThisPage.has(gateway.identity))
+  const candidates = inBand.filter(gateway => recentFailures[gateway.identity] === undefined)
+  if (candidates.length < inBand.length) diagnostics.info('nym', 'skipping gateways that failed in this browser recently', { skipped: inBand.length - candidates.length })
   if (candidates.length === 0) return null
   const chosen = candidates[randomIndex(candidates.length)]
   gatewayDirectory.triedThisPage.add(chosen.identity)
@@ -680,7 +721,7 @@ async function gatewayPerformance (identity) {
 // The keys and gateway registration stored under that id are reused, so the address in an
 // existing share link stays valid and messages the gateway held meanwhile are delivered.
 // Sends made while the client is being replaced wait for it (up to NYM_SEND_WAIT_MS).
-async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
+async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberFailures = true } = {}) {
   const startedAt = performance.now()
   const clientId = NYM_CLIENT_ID_PREFIX + crypto.randomUUID()
   const stopHeartbeat = startClientHeartbeat(clientId)
@@ -794,7 +835,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       if (generation !== clientGeneration || node.state !== 'connected') return
       const messageCounts = node.counters.dataFramesIn + node.counters.dataFramesOut + node.counters.controlIn + node.counters.controlOut
       const baseline = gatewayTrafficBaseline
-      gatewayTrafficBaseline = { generation, reading, messageCounts }
+      gatewayTrafficBaseline = { generation, reading, messageCounts, takenAt: performance.now() }
       if (!baseline || baseline.generation !== generation || reading.binaryMessagesOut < baseline.reading.binaryMessagesOut) return
       const phase = messageCounts !== baseline.messageCounts ? 'busy' : 'idle'
       const sample = {
@@ -810,7 +851,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
         hiddenSamples: document.visibilityState === 'hidden' ? 1 : 0,
         samples: 1
       }
-      evaluateHealth(sample)
+      evaluateHealth(sample, baseline.takenAt)
       if (gatewayTrafficWindow && gatewayTrafficWindow.phase !== phase) flushGatewayTrafficWindow()
       if (!gatewayTrafficWindow) gatewayTrafficWindow = { phase, totals: createTrafficTotals() }
       addTrafficTotals(gatewayTrafficWindow.totals, sample)
@@ -835,6 +876,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       healthWaiters = []
       for (const waiter of waiters) waiter()
     }
+    if (state === 'degraded' && previous !== 'degraded' && rememberFailures && (faultInjection.hideAcknowledgementsUntil <= Date.now() || faultInjection.rememberFaultFailures)) {
+      rememberGatewayFailure(node.gateway, 'failed the health check')
+    }
     if (state !== previous) {
       diagnostics.log(state === 'degraded' ? 'warn' : 'info', 'nym', 'incoming path ' + state, { acknowledgementsPerPacketOut: node.health.acknowledgementReturn, roundTripsToSelfMs: node.health.probeMs, checks: node.health.checks, gateway: describeGateway(node.gateway) })
       try { node.onHealthChange?.(node.health) } catch (error) { diagnostics.error('nym', 'health handler failed', error) }
@@ -851,8 +895,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     const passed = acknowledgementReturn >= HEALTH_FIRST_CHECK_ACK_MINIMUM && medianProbeMs <= HEALTH_PROBE_MAX_MS
     setHealth(passed ? 'healthy' : 'degraded', { acknowledgementReturn, probeMs, failedWindows: 0, checks: 1 })
   }
-  const evaluateHealth = sample => {
+  let healthSettledAt = 0
+  const evaluateHealth = (sample, sampleStartedAt) => {
     if (node.health.state === 'degraded' || sample.packetsOut < HEALTH_MIN_PACKETS_PER_WINDOW) return
+    if (sampleStartedAt < healthSettledAt) return
     const acknowledgementReturn = Math.round(sample.acknowledgementsIn / sample.packetsOut * 100) / 100
     if (node.health.state === 'checking') return // the first check takes its own readings
     const passed = acknowledgementReturn >= HEALTH_STEADY_ACK_MINIMUM
@@ -875,6 +921,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     clearTimeout(firstHealthCheckTimer)
     const thisCheck = { acknowledgementReturn: null, probeMs: null }
     firstCheck = thisCheck
+    healthSettledAt = performance.now() + HEALTH_SETTLE_MS
+    // A new client means new counters and possibly a new gateway: close the logged traffic window
+    // so no window mixes two gateways.
+    flushGatewayTrafficWindow()
     gatewayTrafficBaseline = null
     sampleGatewayTraffic()
     // Its own readings, exactly HEALTH_FIRST_CHECK_MS apart, so the regular 10 s samples cannot
@@ -1112,6 +1162,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       throw new Error('The Nym client was stopped while connecting.')
     }
     if (gatewayUnresponsive) {
+      if (rememberFailures && preferredGateway && (!stallThisAttempt || faultInjection.rememberFaultFailures)) {
+        rememberGatewayFailure({ identity: preferredGateway, performance: await gatewayPerformance(preferredGateway) }, 'stalled while connecting')
+      }
       diagnostics.warn('nym', 'connecting made no progress for ' + GATEWAY_STALL_TIMEOUT_MS / 1000 + ' s; trying another gateway', { purpose, gateway: preferredGateway ? preferredGateway.slice(0, 6) + '...' : 'chosen by the Nym client', gatewayEventsSeen: lastGatewayEventAt > 0 })
       await shutDownClient(candidate, purpose)
       const error = new Error('The gateway stopped responding while connecting (no progress for ' + GATEWAY_STALL_TIMEOUT_MS / 1000 + ' seconds).')
@@ -2644,13 +2697,13 @@ function startHelloRetries () {
   receiveSession.hellosSent = 0
   receiveSession.helloSentAt = new Map()
   receiveSession.helloStartedAt = performance.now()
-  const sendHello = () => {
-    // No return address: the sender answers through the reply blocks attached to this message.
-    sendNumberedHello()
-    const waitedMs = performance.now() - receiveSession.helloStartedAt
-    receiveSession.helloTimer = setTimeout(sendHello, waitedMs < SENDER_REPLY_TIMEOUT_MS ? HELLO_RETRY_INTERVAL_MS : HELLO_RETRY_SLOW_INTERVAL_MS)
-  }
-  sendHello()
+  sendHelloAndScheduleNext()
+}
+// No return address: the sender answers through the reply blocks attached to each hello.
+function sendHelloAndScheduleNext () {
+  sendNumberedHello()
+  const waitedMs = performance.now() - receiveSession.helloStartedAt
+  receiveSession.helloTimer = setTimeout(sendHelloAndScheduleNext, waitedMs < SENDER_REPLY_TIMEOUT_MS ? HELLO_RETRY_INTERVAL_MS : HELLO_RETRY_SLOW_INTERVAL_MS)
 }
 // Sends one hello with the next attempt number and remembers when, so the answer (which echoes the
 // number) gives a true round trip even when answers arrive out of order.
@@ -2860,7 +2913,16 @@ function noteReceiverData () {
 // through reply blocks that lead to the old gateway, so a new link, which carries fresh ones, is
 // opened at once instead of waiting for the stall timer.
 function handleReceiverReconnected (sameAddress) {
-  if (sameAddress || !receiveSession.downloading || !receiveSession.stall) return
+  if (sameAddress) return
+  // Still waiting for the sender's first answer: an answer to an earlier hello would go to the old
+  // gateway, so ask again now, with reply blocks for the new one, instead of at the next retry.
+  if (!receiveSession.downloading && receiveSession.helloTimer && !receiveSession.senderOnline) {
+    diagnostics.info('receive', 'this page moved to another gateway; asking the sender again now', { hellosSent: receiveSession.hellosSent })
+    stopHelloRetries()
+    sendHelloAndScheduleNext()
+    return
+  }
+  if (!receiveSession.downloading || !receiveSession.stall) return
   const stall = receiveSession.stall
   diagnostics.info('receive', 'this page moved to another gateway; opening a new link to the sender', { linkGeneration: receiveSession.linkGeneration })
   if (stall.stage === 'healthy') stall.stalledAt = receiveSession.lastDataAt
@@ -3165,7 +3227,8 @@ async function runGatewayTest (runs) {
     const result = { run, band: band.label }
     let node = null
     try {
-      node = await createNymNode(mode, null, { gatewayBand: band })
+      // The test samples bands as published: it neither skips nor records failed gateways.
+      node = await createNymNode(mode, null, { gatewayBand: Object.assign({ skipRecentFailures: false }, band), rememberFailures: false })
       result.gateway = describeGateway(node.gateway)
       result.connectMs = node.connectMs
       const verdict = await node.waitForHealthVerdict(HEALTH_FIRST_CHECK_MS + 6000)
@@ -3443,6 +3506,14 @@ if (FAULT_INJECTION_ENABLED) {
     stallConnects (count = 1) {
       faultInjection.stallConnects = Math.max(0, Number(count) || 0)
       diagnostics.warn('fault', 'the next connects will look stalled', { count: faultInjection.stallConnects })
+    },
+    // Lets failures caused by these controls be remembered like real ones, to test the memory.
+    rememberFaultFailures (enabled = true) {
+      faultInjection.rememberFaultFailures = Boolean(enabled)
+      diagnostics.warn('fault', 'failures caused by fault controls ' + (enabled ? 'will' : 'will not') + ' be remembered')
+    },
+    rememberedGatewayFailures () {
+      return Object.entries(readGatewayFailures()).map(([identity, failedAt]) => ({ gateway: identity.slice(0, 6) + '...', minutesAgo: Math.round((Date.now() - failedAt) / 60000) }))
     },
     hideAcknowledgements (seconds) {
       faultInjection.hideAcknowledgementsUntil = Date.now() + seconds * 1000

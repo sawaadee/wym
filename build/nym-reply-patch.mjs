@@ -17,7 +17,8 @@
   SDK has no disconnect event), counts the messages and bytes the worker exchanges with its
   gateway, telling acknowledgements apart from full packets (wymGatewayTraffic()), records when
   each network step of a connect happens (wymConnectTimeline()), exposes wymCloseGatewaySockets()
-  for fault-injection tests, and
+  for fault-injection tests, keeps the client's own console output from naming Nym addresses or
+  gateway hosts (WORKER_CONSOLE_FILTER), and
   returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
 
   The worker source is decoded and re-encoded as Latin-1 so every byte outside the patched
@@ -180,11 +181,35 @@ const GATEWAY_SOCKET_TRACKING = `
   // ---- end wym patch ------------------------------------------------------------------------
 `
 
+// The Nym WASM client writes a console line for every message it sends, with the recipient's full
+// Nym address, and for every gateway connection, with the gateway's host name. That lands in the
+// browser console and in anything copied from it, and on a large transfer it prints a line per
+// frame. The page's own diagnostics log never records either. This filter drops the client's
+// routine output (log, info, debug, trace) and keeps warnings and errors, with every Nym address,
+// base58 key or tag of 20 characters or more, and wss:// or https:// host replaced by a placeholder.
+const WORKER_CONSOLE_FILTER = `
+  // ---- wym patch: console filter ----------------------------------------------------------
+  const WYM_ADDRESS_PATTERN = /[1-9A-HJ-NP-Za-km-z]{20,}(?:\\.[1-9A-HJ-NP-Za-km-z]{20,})?(?:@[1-9A-HJ-NP-Za-km-z]{20,})?/g;
+  const WYM_URL_PATTERN = /\\b(wss?|https?):\\/\\/[^\\s"'\\/]+/g;
+  function wymRedact(value) {
+      if (typeof value !== 'string') return value;
+      return value.replace(WYM_URL_PATTERN, '$1://[host]').replace(WYM_ADDRESS_PATTERN, '[redacted]');
+  }
+  const wymNativeConsole = { warn: console.warn.bind(console), error: console.error.bind(console) };
+  ['log', 'info', 'debug', 'trace'].forEach(function (method) { console[method] = function () {}; });
+  ['warn', 'error'].forEach(function (method) {
+      console[method] = function () {
+          wymNativeConsole[method].apply(null, Array.prototype.map.call(arguments, wymRedact));
+      };
+  });
+  // ---- end wym patch ------------------------------------------------------------------------
+`
+
 // [anchor, replacement] pairs applied to the decoded worker source, in order.
 const WORKER_EDITS = [
   [
     "(function () {\n  'use strict';\n",
-    "(function () {\n  'use strict';\n" + GATEWAY_SOCKET_TRACKING
+    "(function () {\n  'use strict';\n" + WORKER_CONSOLE_FILTER + GATEWAY_SOCKET_TRACKING
   ],
   [
     '  const ClientConfigFinalization = ',
