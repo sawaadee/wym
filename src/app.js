@@ -2194,8 +2194,13 @@ async function openShareLink (linkText, { fromAddressBar = false } = {}) {
   setReceiveHeading(files.length === 1 ? 'A file for you' : files.length + ' files for you', 'Encrypted end to end. Only people with this link can open them.')
   renderFileRows(elementById('receive-file-list'), files)
   elementById('receive-file-summary').textContent = describeFileTotals(files)
-  // Each side runs its own network mode; they do not need to match.
-  elementById('receive-mode').textContent = 'Your network mode: ' + MODE_LABELS[currentMode()] + '. The sender is using ' + MODE_LABELS[link.mode] + '.'
+  // Each side runs its own network mode, and each mode only shapes that side's own traffic, so
+  // they do not need to match. The sentence says so, because "the sender uses another mode" reads
+  // as if the recipient had to match it.
+  const ownMode = MODE_LABELS[currentMode()]
+  elementById('receive-mode').textContent = link.mode === currentMode()
+    ? 'Your network mode: ' + ownMode + ', the same as the sender. Each side\'s mode only affects its own connection.'
+    : 'Your network mode: ' + ownMode + '. It only affects your own connection; the sender chose ' + MODE_LABELS[link.mode] + ' for theirs.'
   await connectReceiver()
 }
 
