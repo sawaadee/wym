@@ -265,7 +265,9 @@
   .status[data-tone="positive"] .status-icon { color: var(--positive); }
   .status[data-tone="warning"] .status-icon { color: var(--warning); }
   .status[data-tone="error"] .status-icon { color: var(--negative); }
-  .status-caption { margin-top: 8px !important; font-size: 13px; color: var(--text-secondary); }
+  /* Two lines are always reserved for the caption, so a shorter one does not pull the buttons up. */
+  .status-caption { margin-top: 8px !important; font-size: 13px; line-height: 1.47; min-height: calc(2 * 1.47em); color: var(--text-secondary); }
+  .progress-track.is-empty { visibility: hidden; }
   .progress-track { position: relative; height: 6px; border-radius: 999px; background: var(--progress-track); overflow: hidden; margin-top: 12px; }
   .progress-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
   .status[data-tone="positive"] .progress-fill { background: var(--positive); }

@@ -1771,11 +1771,12 @@ function renderStatus (prefix, { tone = 'neutral', icon, spin = false, text, cap
   }
   elementById(prefix + '-status-text').textContent = text
   const captionElement = elementById(prefix + '-status-caption')
-  captionElement.textContent = caption
-  captionElement.classList.toggle('hidden', !caption)
+  captionElement.textContent = caption // an empty caption keeps its reserved space too
   const track = elementById(prefix + '-status-track')
   const fill = elementById(prefix + '-status-fill')
-  track.classList.toggle('hidden', progress === null)
+  // A stage without a bar keeps the bar's space, so the buttons below never move under a finger
+  // or pointer as the status changes (seen in testing: Download jumped 45 px just as it was tapped).
+  track.classList.toggle('is-empty', progress === null)
   if (progress === 'indeterminate') {
     track.dataset.mode = 'indeterminate'
     fill.style.width = ''
@@ -2663,7 +2664,7 @@ async function openShareLink (linkText, { fromAddressBar = false } = {}) {
   }
 
   const files = receiveSession.files
-  setReceiveHeading(files.length === 1 ? 'A file for you' : files.length + ' files for you', 'Encrypted end to end. Only people with this link can open them.')
+  setReceiveHeading(files.length === 1 ? 'A file for you' : files.length + ' files for you', files.length === 1 ? 'Encrypted end to end. Only people with this link can open it.' : 'Encrypted end to end. Only people with this link can open them.')
   renderFileRows(elementById('receive-file-list'), files)
   elementById('receive-file-summary').textContent = describeFileTotals(files)
   // Each side runs its own network mode, and each mode only shapes that side's own traffic, so
