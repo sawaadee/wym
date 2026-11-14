@@ -496,6 +496,7 @@ const GATEWAY_TRAFFIC_IDLE_LOG_INTERVAL_MS = 60000
 // Samples with fewer than HEALTH_MIN_PACKETS_PER_WINDOW packets sent are too small to judge.
 const HEALTH_FIRST_CHECK_MS = 8000
 const HEALTH_FIRST_CHECK_ACK_MINIMUM = 0.75
+const HEALTH_ACK_GRACE_MS = 1500
 const HEALTH_PROBES = 3
 const HEALTH_PROBE_SPACING_MS = 300
 const HEALTH_PROBE_TIMEOUT_MS = 7000
@@ -937,14 +938,22 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     // shorten the window (acknowledgements trail their packets by about a second).
     const generation = clientGeneration
     const startReading = mixnetClient.client.wymGatewayTraffic().catch(() => null)
+    // Packets are counted over HEALTH_FIRST_CHECK_MS and their acknowledgements over
+    // HEALTH_ACK_GRACE_MS longer, so the ones still in flight when the window closes are not
+    // missed. Without the grace period healthy gateways read 0.73 to 0.76 in Balanced, where more
+    // packets are in flight at any moment, against 0.83 to 1.00 in Maximum.
+    const readNow = () => (mixnetClient && generation === clientGeneration ? mixnetClient.client.wymGatewayTraffic().catch(() => null) : Promise.resolve(null))
     firstHealthCheckTimer = setTimeout(async () => {
-      const start = await startReading
-      const end = mixnetClient && generation === clientGeneration ? await mixnetClient.client.wymGatewayTraffic().catch(() => null) : null
-      if (firstCheck !== thisCheck || !start || !end) return
-      const packetsOut = end.binaryMessagesOut - start.binaryMessagesOut
-      const acknowledgements = faultInjection.hideAcknowledgementsUntil > Date.now() ? 0 : end.acknowledgementsIn - start.acknowledgementsIn
-      thisCheck.acknowledgementReturn = packetsOut > 0 ? Math.round(acknowledgements / packetsOut * 100) / 100 : 0
-      concludeFirstCheck()
+      const packetsEnd = await readNow()
+      firstHealthCheckTimer = setTimeout(async () => {
+        const start = await startReading
+        const acknowledgementsEnd = await readNow()
+        if (firstCheck !== thisCheck || !start || !packetsEnd || !acknowledgementsEnd) return
+        const packetsOut = packetsEnd.binaryMessagesOut - start.binaryMessagesOut
+        const acknowledgements = faultInjection.hideAcknowledgementsUntil > Date.now() ? 0 : acknowledgementsEnd.acknowledgementsIn - start.acknowledgementsIn
+        thisCheck.acknowledgementReturn = packetsOut > 0 ? Math.round(acknowledgements / packetsOut * 100) / 100 : 0
+        concludeFirstCheck()
+      }, HEALTH_ACK_GRACE_MS)
     }, HEALTH_FIRST_CHECK_MS)
     Promise.all(Array.from({ length: HEALTH_PROBES }, (unused, index) =>
       new Promise(resolve => setTimeout(resolve, index * HEALTH_PROBE_SPACING_MS))
