@@ -64,12 +64,15 @@ const MAX_NYM_MESSAGE_BYTES = 32768
 // through these, so it never learns the recipient's Nym address. Each one carries one reply
 // packet; when the sender runs short, its Nym client asks the recipient's client for more.
 const RECIPIENT_REPLY_SURBS_PER_MESSAGE = 10
-// Receiver stall recovery. With no data for STALL_RELINK_AFTER_MS the receiver opens a fresh
-// link to the sender; still nothing after STALL_SENDER_CHECK_AFTER_MS, it asks whether the sender
-// is online again every STALL_SENDER_CHECK_INTERVAL_MS and opens a new link whenever it answers.
+// Receiver stall recovery. "Data" means bytes delivered in order to WebTorrent; frames waiting
+// behind a gap do not count. With no data for STALL_RELINK_AFTER_MS the receiver opens a fresh
+// link to the sender. If that link brings nothing within STALL_SENDER_CHECK_AFTER_RELINK_MS, or
+// any link closes before the transfer finishes, it asks whether the sender is online, again every
+// STALL_SENDER_CHECK_INTERVAL_MS, and opens a new link whenever the sender answers. In testing a
+// fresh link's first frame arrived within 0.3 to 3.5 s, so 15 s without one means it failed.
 const STALL_RELINK_AFTER_MS = 20000
-const STALL_SENDER_CHECK_AFTER_MS = 45000
-const STALL_SENDER_CHECK_INTERVAL_MS = 30000
+const STALL_SENDER_CHECK_AFTER_RELINK_MS = 15000
+const STALL_SENDER_CHECK_INTERVAL_MS = 20000
 const STALL_CHECK_INTERVAL_MS = 2000
 const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
 
@@ -959,7 +962,7 @@ function parseShareLink (link) {
 // While this tab is sending or receiving, a sleeping screen can suspend it and drop its Nym
 // connection. Browsers release the lock whenever the tab is hidden, so it is requested again
 // each time the tab becomes visible while it is still wanted.
-const wakeLock = { wantedBy: new Set(), sentinel: null }
+const wakeLock = { wantedBy: new Set(), sentinel: null, refusalLogged: false }
 async function acquireWakeLock (reason) {
   wakeLock.wantedBy.add(reason)
   if (!('wakeLock' in navigator)) {
@@ -975,7 +978,9 @@ async function acquireWakeLock (reason) {
       diagnostics.info('env', 'screen wake lock released', { stillWanted: wakeLock.wantedBy.size > 0 })
     })
   } catch (error) {
-    diagnostics.warn('env', 'screen wake lock refused', error)
+    // Refusals repeat on every visibility change in a browser that does not allow the lock.
+    if (!wakeLock.refusalLogged) diagnostics.warn('env', 'screen wake lock refused; the device may sleep during the transfer', error)
+    wakeLock.refusalLogged = true
   }
 }
 function releaseWakeLock (reason) {
@@ -1331,7 +1336,7 @@ async function stopSharing () {
 const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null }
 
 function newStallState () {
-  return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0 }
+  return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0, relinkedAt: 0 }
 }
 
 async function openShareLink (linkText) {
@@ -1492,6 +1497,7 @@ function openReceiverLink (reason) {
   const previous = receiveSession.linkStream
   if (previous) {
     const previousLinkId = bytesToHex(previous.linkIdBytes)
+    previous.retiredByReceiver = true
     receiveSession.retiredLinkIds.add(previousLinkId)
     node.sendControl({ kind: 'close', infoHash: link.infoHash, linkId: previousLinkId, recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
     previous.destroy()
@@ -1499,8 +1505,17 @@ function openReceiverLink (reason) {
   receiveSession.LinkStream = receiveSession.LinkStream ?? createLinkStreamClass()
   const linkIdBytes = crypto.getRandomValues(new Uint8Array(LINK_ID_BYTES))
   receiveSession.linkGeneration += 1
-  receiveSession.linkStream = new receiveSession.LinkStream({ label: redactNymAddress(link.senderAddress), send: frame => node.send(frame, link.senderAddress) }, linkIdBytes)
+  const linkStream = new receiveSession.LinkStream({ label: redactNymAddress(link.senderAddress), send: frame => node.send(frame, link.senderAddress) }, linkIdBytes)
+  receiveSession.linkStream = linkStream
   receiveSession.lastDataAt = Date.now()
+  receiveSession.stall.relinkedAt = Date.now()
+  // WebTorrent closes a peer whose BitTorrent handshake never arrives (after about 25 s), and a
+  // link can also fail on a write error. Either way, waiting longer on it cannot help.
+  linkStream.once('close', () => {
+    if (linkStream.retiredByReceiver || receiveSession.linkStream !== linkStream || !receiveSession.downloading) return
+    diagnostics.warn('receive', 'the link closed before the transfer finished', { linkGeneration: receiveSession.linkGeneration, framesIn: linkStream.stats.framesIn })
+    checkSenderDuringStall('the link closed')
+  })
   node.sendControl({ kind: 'open', infoHash: link.infoHash, linkId: bytesToHex(linkIdBytes), recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
   const added = receiveSession.torrent.addPeer(receiveSession.linkStream)
   diagnostics.info('receive', 'link added to torrent', { added, reason, linkGeneration: receiveSession.linkGeneration })
@@ -1510,8 +1525,9 @@ function routeReceiverFrame (frame) {
   const linkIdHex = bytesToHex(frame.subarray(1, 1 + LINK_ID_BYTES))
   const current = receiveSession.linkStream
   if (current && linkIdHex === bytesToHex(current.linkIdBytes)) {
-    noteReceiverData()
+    const deliveredBefore = current.nextExpectedSequence
     current.receiveFrame(frame)
+    if (current.nextExpectedSequence > deliveredBefore) noteReceiverData()
     return
   }
   if (receiveSession.retiredLinkIds.has(linkIdHex)) {
@@ -1558,15 +1574,24 @@ function checkReceiverHealth () {
     openReceiverLink('stalled')
     return
   }
-  if (stall.stage !== 'healthy' && quietMs >= STALL_SENDER_CHECK_AFTER_MS && now - stall.lastSenderCheckAt >= STALL_SENDER_CHECK_INTERVAL_MS) {
-    stall.stage = 'checking-sender'
-    stall.lastSenderCheckAt = now
-    stall.senderChecks += 1
-    diagnostics.warn('receive', 'still no data; checking whether the sender is online', Object.assign({ senderChecks: stall.senderChecks }, transferState()))
-    showReceiveNotice('warning', 'Waiting for the sender. Their tab may be closed, asleep or offline. This page keeps trying.')
-    receiveSession.helloSentAt = performance.now()
-    node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId }, receiveSession.link.senderAddress).catch(() => {})
+  if (stall.stage !== 'healthy' && now - stall.relinkedAt >= STALL_SENDER_CHECK_AFTER_RELINK_MS && now - stall.lastSenderCheckAt >= STALL_SENDER_CHECK_INTERVAL_MS) {
+    checkSenderDuringStall('no data on the new link', transferState())
   }
+}
+
+// Asks the sender whether it is online. Its "available" answer opens a fresh link (see
+// handleReceiverControl). Repeated every STALL_SENDER_CHECK_INTERVAL_MS until data flows again.
+function checkSenderDuringStall (reason, details = {}) {
+  const stall = receiveSession.stall
+  if (!stall) return
+  if (stall.stage === 'healthy') stall.stalledAt = receiveSession.lastDataAt
+  stall.stage = 'checking-sender'
+  stall.lastSenderCheckAt = Date.now()
+  stall.senderChecks += 1
+  diagnostics.warn('receive', 'checking whether the sender is online', Object.assign({ reason, senderChecks: stall.senderChecks }, details))
+  showReceiveNotice('warning', 'Waiting for the sender. Their tab may be closed, asleep or offline. This page keeps trying.')
+  receiveSession.helloSentAt = performance.now()
+  receiveSession.node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId }, receiveSession.link.senderAddress).catch(() => {})
 }
 
 async function finishDownload (torrent) {
