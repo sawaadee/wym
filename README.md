@@ -75,6 +75,7 @@ Opening the page with `?faults=1` adds test controls in the browser console:
 - `nymShareFaults.delayIncomingMessages(milliseconds)` holds every incoming message for that long, imitating a slow path. Pass 0 to stop.
 - `nymShareFaults.closeGatewaySockets()` closes this page's connection to its Nym gateway.
 - `nymShareFaults.replaceNymClient()` replaces the Nym client immediately.
+- `nymShareFaults.stallConnects(count)` makes the next count connects see no progress from their gateway, so abandoning a stalled connect after 8 seconds can be tested.
 - `nymShareFaults.hideAcknowledgements(seconds)` makes the health check see no acknowledgements for that long, as on a broken gateway, so the page's gateway move can be tested on a working one.
 
 Opening the page with `?gatewaytest=N` (up to 60) runs the gateway test instead of the normal page: N fresh connections in a row, cycling through the score bands above, each recording the gateway's score, the connect timeline, the acknowledgement checks, three round trips to its own address, and the time to reconnect to the same gateway and to move to a new one. Each run takes about a minute and uses about 15 MB of data in Maximum privacy. Results appear in a table on the page, in the log, and in `window.nymShareGatewayTest`.

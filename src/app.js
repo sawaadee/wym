@@ -96,7 +96,7 @@ const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
 // Fault injection for testing recovery, enabled only when the page is opened with ?faults=1.
 // It adds window.nymShareFaults; nothing else changes.
 const FAULT_INJECTION_ENABLED = new URLSearchParams(location.search).get('faults') === '1'
-const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0 }
+const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0, stallConnects: 0 }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -1041,20 +1041,23 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     const { createNymMixnetClient } = await loadLibraries()
     lastClientStartedAt = performance.now()
     const candidate = await createNymMixnetClient()
+    // Test only (?faults=1): this attempt sees none of its gateway's events, as if it had stalled.
+    const stallThisAttempt = faultInjection.stallConnects > 0
+    if (stallThisAttempt) faultInjection.stallConnects -= 1
     let connectedAddress = null
     // The wait below wakes on the connected event itself, not on a polling timer: a tab in the
     // background for more than five minutes gets its timers run only once a minute, which made a
     // 5 s connect look like 28 s and would slow every reconnect of a sharing tab left open.
     let wakeWait = () => {}
     candidate.events.subscribeToConnected(event => {
-      if (generation !== clientGeneration) return
+      if (generation !== clientGeneration || stallThisAttempt) return
       connectedAddress = event.args.address
       wakeWait()
     })
     candidate.events.subscribeToRawMessageReceivedEvent(event => { if (generation === clientGeneration) handleRawMessage(event) })
     let lastGatewayEventAt = 0
     candidate.events.subscribeToWymSocketState(event => {
-      if (generation !== clientGeneration) return
+      if (generation !== clientGeneration || stallThisAttempt) return
       lastGatewayEventAt = Date.now()
       handleSocketState(event.args)
       wakeWait()
@@ -3435,6 +3438,12 @@ if (FAULT_INJECTION_ENABLED) {
     },
     // Makes the health check see no acknowledgements for this long, as on a gateway that stopped
     // delivering incoming messages, so the page's response can be tested on a working gateway.
+    // Makes the next count connects see no progress from their gateway, so the page's response to
+    // a stalled connect (abandon it after 8 s, try again) can be tested on a working gateway.
+    stallConnects (count = 1) {
+      faultInjection.stallConnects = Math.max(0, Number(count) || 0)
+      diagnostics.warn('fault', 'the next connects will look stalled', { count: faultInjection.stallConnects })
+    },
     hideAcknowledgements (seconds) {
       faultInjection.hideAcknowledgementsUntil = Date.now() + seconds * 1000
       diagnostics.warn('fault', 'hiding acknowledgements from the health check', { seconds })
