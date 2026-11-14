@@ -273,6 +273,7 @@
           <div class="stat"><div class="stat-label">Upload</div><div class="stat-value" id="stat-upload">0 B/s</div></div>
         </div>
         <div class="notice" data-tone="warning"><i data-lucide="triangle-alert"></i><span>Keep this tab open. Files go straight from this tab to each recipient, and nothing is stored on a server.</span></div>
+        <div class="notice hidden" id="share-notice" data-tone="warning" role="status"><i data-lucide="info"></i><span id="share-notice-text"></span></div>
       </div>
       <ul class="file-list" id="share-file-list"></ul>
     </div>
@@ -295,7 +296,7 @@
         <button class="button button-primary" id="start-download" type="button" disabled><i data-lucide="download"></i>Download</button>
         <button class="button button-secondary hidden" id="save-all" type="button"><i data-lucide="download"></i>Save all</button>
       </div>
-      <div class="notice hidden" id="receive-notice"><i data-lucide="info"></i><span id="receive-notice-text"></span></div>
+      <div class="notice hidden" id="receive-notice" role="status"><i data-lucide="info"></i><span id="receive-notice-text"></span></div>
     </div>
   </section>
 

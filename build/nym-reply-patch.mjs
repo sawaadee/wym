@@ -11,6 +11,10 @@
   patch reads the tag's 16 bytes out of WebAssembly memory, base58-encodes them, forwards the
   tag with each RawMessageReceived event, and exposes rawReply({ payload, senderTag }).
 
+  It also reports the worker's gateway WebSocket open, close and error events to the page (the
+  SDK has no disconnect event), exposes wymCloseGatewaySockets() for fault-injection tests, and
+  returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
+
   The worker source is decoded and re-encoded as Latin-1 so every byte outside the patched
   anchors stays identical. Each anchor must match exactly once; any mismatch (for example after
   a version change) stops the build instead of producing a half-patched worker.
@@ -58,8 +62,48 @@ const SENDER_TAG_HELPERS = `
   // ---- end wym patch ------------------------------------------------------------------------
 `
 
+// Reports the worker's gateway WebSocket lifecycle to the page. The SDK has no disconnect event,
+// so without this the page cannot tell a lost gateway connection from a quiet one. The WASM
+// client resolves the global WebSocket each time it connects, so wrapping the global before the
+// client starts covers its first connection and every reconnection. Gateway URLs are not
+// reported, because they identify the gateway this client uses.
+const GATEWAY_SOCKET_TRACKING = `
+  // ---- wym patch: gateway socket tracking -------------------------------------------------
+  const wymTrackedSockets = new Set();
+  const WymNativeWebSocket = self.WebSocket;
+  function wymReportSocketState(state, details) {
+      self.postMessage({ kind: 'WymSocketState', args: Object.assign({ state: state, openSockets: wymTrackedSockets.size }, details) });
+  }
+  function WymTrackedWebSocket(url, protocols) {
+      const socket = protocols === undefined ? new WymNativeWebSocket(url) : new WymNativeWebSocket(url, protocols);
+      socket.addEventListener('open', function () {
+          wymTrackedSockets.add(socket);
+          wymReportSocketState('open', {});
+      });
+      socket.addEventListener('close', function (event) {
+          wymTrackedSockets.delete(socket);
+          wymReportSocketState('closed', { code: event.code, wasClean: event.wasClean });
+      });
+      socket.addEventListener('error', function () {
+          wymReportSocketState('error', {});
+      });
+      return socket;
+  }
+  WymTrackedWebSocket.prototype = WymNativeWebSocket.prototype;
+  WymTrackedWebSocket.CONNECTING = 0;
+  WymTrackedWebSocket.OPEN = 1;
+  WymTrackedWebSocket.CLOSING = 2;
+  WymTrackedWebSocket.CLOSED = 3;
+  self.WebSocket = WymTrackedWebSocket;
+  // ---- end wym patch ------------------------------------------------------------------------
+`
+
 // [anchor, replacement] pairs applied to the decoded worker source, in order.
 const WORKER_EDITS = [
+  [
+    "(function () {\n  'use strict';\n",
+    "(function () {\n  'use strict';\n" + GATEWAY_SOCKET_TRACKING
+  ],
   [
     '  const ClientConfigFinalization = ',
     SENDER_TAG_HELPERS + '\n  const ClientConfigFinalization = '
@@ -85,7 +129,28 @@ const WORKER_EDITS = [
     '          rawReply: function (args) {\n' +
     '              return wrapper.client.send_reply(args.payload, args.senderTag);\n' +
     '          },\n' +
+    // Closes this client's gateway connections, for fault-injection tests only: the page calls
+    // it solely when opened with ?faults=1. The Nym client then sees a closed connection.
+    '          wymCloseGatewaySockets: function () {\n' +
+    '              const count = wymTrackedSockets.size;\n' +
+    "              wymTrackedSockets.forEach(function (socket) { socket.close(4000, 'fault injection'); });\n" +
+    '              return count;\n' +
+    '          },\n' +
     '          rawSend: function (args) {'
+  ]
+]
+
+// [anchor, replacement] pairs applied to the SDK's main-thread code. They expose the socket
+// events above and let the page terminate a client's worker; stop() alone frees the WASM client
+// but leaves its worker running, so replacing a client would otherwise leak one worker each time.
+const MAIN_THREAD_EDITS = [
+  [
+    '        subscribeToRawMessageReceivedEvent: (handler) => addSubscription(EventKinds.RawMessageReceived, handler),\n    };',
+    "        subscribeToRawMessageReceivedEvent: (handler) => addSubscription(EventKinds.RawMessageReceived, handler),\n        subscribeToWymSocketState: (handler) => addSubscription('WymSocketState', handler),\n    };"
+  ],
+  [
+    '    return {\n        client,\n        events,\n    };',
+    '    return {\n        client,\n        events,\n        terminate: () => worker.terminate(),\n    };'
   ]
 ]
 
@@ -127,7 +192,9 @@ export function patchNymSdkSource (sdkSource) {
   const { start, end } = locateEmbeddedWorker(sdkSource)
   const workerSource = Buffer.from(sdkSource.slice(start, end), 'base64').toString('latin1')
   const patchedWorker = patchWorkerSource(workerSource)
-  return sdkSource.slice(0, start) + Buffer.from(patchedWorker, 'latin1').toString('base64') + sdkSource.slice(end)
+  let patchedSdk = sdkSource.slice(0, start) + Buffer.from(patchedWorker, 'latin1').toString('base64') + sdkSource.slice(end)
+  for (const [anchor, replacement] of MAIN_THREAD_EDITS) patchedSdk = replaceExactlyOnce(patchedSdk, anchor, replacement, 'Nym SDK main-thread patch')
+  return patchedSdk
 }
 
 /** esbuild plugin that applies the patch when the SDK module is loaded. */

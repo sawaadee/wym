@@ -64,6 +64,19 @@ const MAX_NYM_MESSAGE_BYTES = 32768
 // through these, so it never learns the recipient's Nym address. Each one carries one reply
 // packet; when the sender runs short, its Nym client asks the recipient's client for more.
 const RECIPIENT_REPLY_SURBS_PER_MESSAGE = 10
+// Receiver stall recovery. With no data for STALL_RELINK_AFTER_MS the receiver opens a fresh
+// link to the sender; still nothing after STALL_SENDER_CHECK_AFTER_MS, it asks whether the sender
+// is online again every STALL_SENDER_CHECK_INTERVAL_MS and opens a new link whenever it answers.
+const STALL_RELINK_AFTER_MS = 20000
+const STALL_SENDER_CHECK_AFTER_MS = 45000
+const STALL_SENDER_CHECK_INTERVAL_MS = 30000
+const STALL_CHECK_INTERVAL_MS = 2000
+const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
+
+// Fault injection for testing recovery, enabled only when the page is opened with ?faults=1.
+// It adds window.nymShareFaults; nothing else changes.
+const FAULT_INJECTION_ENABLED = new URLSearchParams(location.search).get('faults') === '1'
+const faultInjection = { dropIncomingDataUntil: 0 }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -341,6 +354,7 @@ function describeControlMessage (message) {
   if (typeof message?.linkId === 'string') description.linkId = message.linkId.slice(0, 8)
   if (message?.reason !== undefined) description.reason = message.reason
   if (message?.verified !== undefined) description.verified = message.verified
+  if (typeof message?.recipientId === 'string') description.recipient = message.recipientId.slice(0, 6)
   return description
 }
 
@@ -360,6 +374,12 @@ function describeReplyTag (senderTag) {
 // pulled out from under it.
 const NYM_CONNECT_ATTEMPT_TIMEOUT_MS = 20000
 const NYM_CONNECT_ATTEMPTS = 3
+// How long the Nym client gets to restore a lost gateway connection on its own before the node
+// replaces it, how long a send waits for a reconnecting client, and the longest pause between
+// reconnect attempts.
+const NYM_INTERNAL_RECONNECT_GRACE_MS = 15000
+const NYM_SEND_WAIT_MS = 90000
+const NYM_RECONNECT_MAX_DELAY_MS = 30000
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
@@ -423,6 +443,12 @@ async function removeStaleNymStorage (currentClientId) {
   diagnostics.info('storage', 'earlier Nym client storage removed', { removed: staleNames.length, otherLiveClients })
 }
 
+// A Nym node is one Nym identity (clientId) for the life of the page. The Nym client behind it
+// can be replaced: if the gateway connection is lost and the Nym client does not restore it
+// within NYM_INTERNAL_RECONNECT_GRACE_MS, the node starts a new client with the same clientId.
+// The keys and gateway registration stored under that id are reused, so the address in an
+// existing share link stays valid and messages the gateway held meanwhile are delivered.
+// Sends made while the client is being replaced wait for it (up to NYM_SEND_WAIT_MS).
 async function createNymNode (mode) {
   const startedAt = performance.now()
   const clientId = NYM_CLIENT_ID_PREFIX + crypto.randomUUID()
@@ -433,22 +459,56 @@ async function createNymNode (mode) {
     diagnostics.warn('storage', 'cleanup of earlier Nym client storage failed', error)
   }
   diagnostics.info('nym', 'starting client', { mode, override: NYM_CLIENT_OVERRIDES[mode] ?? 'Nym defaults' })
-  const { createNymMixnetClient } = await loadLibraries()
-  const mixnetClient = await createNymMixnetClient()
+
   const node = {
     address: null,
+    mode,
+    state: 'connecting', // connecting, connected, reconnecting, stopped
     onControl: null,
     onData: null,
-    counters: { dataFramesIn: 0, dataBytesIn: 0, dataFramesOut: 0, dataBytesOut: 0, controlIn: 0, controlOut: 0, sendFailures: 0, unknownMessages: 0 }
+    onReconnected: null,
+    counters: { dataFramesIn: 0, dataBytesIn: 0, dataFramesOut: 0, dataBytesOut: 0, controlIn: 0, controlOut: 0, sendFailures: 0, unknownMessages: 0, gatewayDisconnects: 0, reconnects: 0, faultDroppedFrames: 0 }
+  }
+  let mixnetClient = null
+  let clientGeneration = 0
+  let usableWaiters = []
+  let socketGraceTimer = null
+  let socketLostAt = 0
+  let reconnectPromise = null
+
+  const setState = state => {
+    node.state = state
+    if (state !== 'connected') return
+    const waiters = usableWaiters
+    usableWaiters = []
+    for (const waiter of waiters) waiter.resolve()
   }
 
-  mixnetClient.events.subscribeToConnected(event => { node.address = event.args.address })
+  // Resolves once the node can send. Rejects after NYM_SEND_WAIT_MS so a sender is never stuck
+  // behind a client that cannot come back.
+  const waitUntilUsable = () => {
+    if (node.state === 'connected') return Promise.resolve()
+    if (node.state === 'stopped') return Promise.reject(new Error('The Nym client was stopped.'))
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve: () => { clearTimeout(waiter.timer); resolve() } }
+      waiter.timer = setTimeout(() => {
+        usableWaiters = usableWaiters.filter(entry => entry !== waiter)
+        reject(new Error('The Nym client did not reconnect within ' + NYM_SEND_WAIT_MS / 1000 + ' seconds.'))
+      }, NYM_SEND_WAIT_MS)
+      usableWaiters.push(waiter)
+    })
+  }
+
   // senderTag is set when the message carried reply blocks (see build/nym-reply-patch.mjs),
   // and null for replies, which carry none.
-  mixnetClient.events.subscribeToRawMessageReceivedEvent(event => {
+  const handleRawMessage = event => {
     const payload = event.args.payload
     const senderTag = typeof event.args.senderTag === 'string' ? event.args.senderTag : null
     if (payload[0] === MESSAGE_KIND_DATA) {
+      if (faultInjection.dropIncomingDataUntil > Date.now()) {
+        node.counters.faultDroppedFrames += 1
+        return
+      }
       node.counters.dataFramesIn += 1
       node.counters.dataBytesIn += payload.length
       node.onData?.(payload, senderTag)
@@ -473,36 +533,129 @@ async function createNymNode (mode) {
     } catch (error) {
       diagnostics.error('control', 'handler failed for ' + message?.kind, error)
     }
-  })
+  }
 
-  // Shuts down a client that never became usable, so a failed attempt does not keep a
-  // worker running or leave its key database behind.
-  const discardClient = async () => {
-    try { await mixnetClient.client.stop?.() } catch (error) { diagnostics.warn('nym', 'stopping failed client failed', error) }
+  // The Nym client retries a lost gateway connection by itself (10 attempts, 5 s apart). The
+  // node gives it NYM_INTERNAL_RECONNECT_GRACE_MS before replacing the client.
+  const handleSocketState = ({ state, code, wasClean, openSockets }) => {
+    if (state === 'open') {
+      if (socketGraceTimer) {
+        clearTimeout(socketGraceTimer)
+        socketGraceTimer = null
+        diagnostics.info('nym', 'gateway connection restored by the Nym client', { afterMs: Math.round(performance.now() - socketLostAt) })
+        setNetworkStatus('connected', 'Connected to Nym')
+      }
+      return
+    }
+    if (state === 'error') {
+      diagnostics.warn('nym', 'gateway connection error', { openSockets, nodeState: node.state })
+      return
+    }
+    if (node.state !== 'connected' || openSockets > 0 || socketGraceTimer) {
+      diagnostics.info('nym', 'a gateway connection closed', { code, wasClean, openSockets, nodeState: node.state })
+      return
+    }
+    node.counters.gatewayDisconnects += 1
+    socketLostAt = performance.now()
+    diagnostics.warn('nym', 'gateway connection lost', { code, wasClean, waitingMs: NYM_INTERNAL_RECONNECT_GRACE_MS })
+    setNetworkStatus('connecting', 'Reconnecting to Nym')
+    socketGraceTimer = setTimeout(() => {
+      socketGraceTimer = null
+      node.reconnect('the gateway connection did not come back within ' + NYM_INTERNAL_RECONNECT_GRACE_MS / 1000 + ' s')
+    }, NYM_INTERNAL_RECONNECT_GRACE_MS)
+  }
+
+  const shutDownClient = async (client, purpose) => {
+    try { await client.client.stop?.() } catch (error) { diagnostics.warn('nym', 'client stop failed', { purpose, error }) }
+    try { client.terminate?.() } catch (error) { diagnostics.warn('nym', 'worker terminate failed', { purpose, error }) }
+  }
+
+  // Starts a Nym client under this node's clientId and waits for its gateway connection.
+  // Events from a client that has since been replaced are ignored.
+  const startClient = async purpose => {
+    const generation = ++clientGeneration
+    const attemptStartedAt = performance.now()
+    const { createNymMixnetClient } = await loadLibraries()
+    const candidate = await createNymMixnetClient()
+    let connectedAddress = null
+    candidate.events.subscribeToConnected(event => { if (generation === clientGeneration) connectedAddress = event.args.address })
+    candidate.events.subscribeToRawMessageReceivedEvent(event => { if (generation === clientGeneration) handleRawMessage(event) })
+    candidate.events.subscribeToWymSocketState(event => { if (generation === clientGeneration) handleSocketState(event.args) })
+    const startOptions = { clientId, nymApiUrl: NYM_API_URL, forceTls: true }
+    if (NYM_CLIENT_OVERRIDES[mode]) startOptions.clientOverride = NYM_CLIENT_OVERRIDES[mode]
+    try {
+      await candidate.client.start(startOptions)
+    } catch (error) {
+      await shutDownClient(candidate, purpose)
+      throw error
+    }
+    diagnostics.info('nym', 'client started, waiting for gateway', { purpose, ms: Math.round(performance.now() - attemptStartedAt) })
+    const deadline = Date.now() + NYM_CONNECT_ATTEMPT_TIMEOUT_MS
+    while (!connectedAddress && Date.now() < deadline && generation === clientGeneration) await new Promise(resolve => setTimeout(resolve, 200))
+    if (generation !== clientGeneration || node.state === 'stopped') {
+      // The node was stopped while this client was connecting; do not leave it running.
+      await shutDownClient(candidate, purpose)
+      throw new Error('The Nym client was stopped while connecting.')
+    }
+    if (!connectedAddress) {
+      diagnostics.warn('nym', 'no gateway connection within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' s; discarding this client', { purpose, mode })
+      await shutDownClient(candidate, purpose)
+      throw new Error('Could not connect to the Nym network within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' seconds.')
+    }
+    mixnetClient = candidate
+    return { address: connectedAddress, ms: Math.round(performance.now() - attemptStartedAt) }
+  }
+
+  try {
+    const { address } = await startClient('initial')
+    node.address = address
+  } catch (error) {
+    // A first attempt that never connected leaves nothing worth keeping.
     stopHeartbeat()
     indexedDB.deleteDatabase(NYM_STORAGE_PREFIX + clientId)
-  }
-
-  const startOptions = { clientId, nymApiUrl: NYM_API_URL, forceTls: true }
-  if (NYM_CLIENT_OVERRIDES[mode]) startOptions.clientOverride = NYM_CLIENT_OVERRIDES[mode]
-  try {
-    await mixnetClient.client.start(startOptions)
-  } catch (error) {
-    await discardClient()
     throw error
   }
-  diagnostics.info('nym', 'client started, waiting for gateway', { ms: Math.round(performance.now() - startedAt) })
-
-  const deadline = Date.now() + NYM_CONNECT_ATTEMPT_TIMEOUT_MS
-  while (!node.address && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200))
-  if (!node.address) {
-    diagnostics.warn('nym', 'no gateway connection within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' s; discarding this client', { mode })
-    await discardClient()
-    throw new Error('Could not connect to the Nym network within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' seconds.')
-  }
+  setState('connected')
   diagnostics.info('nym', 'connected', { address: redactNymAddress(node.address), ms: Math.round(performance.now() - startedAt) })
 
-  node.mode = mode
+  // Replaces the Nym client, keeping this node's identity. Concurrent calls share one attempt.
+  node.reconnect = reason => {
+    if (node.state === 'stopped') return Promise.resolve(false)
+    if (reconnectPromise) return reconnectPromise
+    reconnectPromise = (async () => {
+      const reconnectStartedAt = performance.now()
+      setState('reconnecting')
+      setNetworkStatus('connecting', 'Reconnecting to Nym')
+      diagnostics.warn('nym', 'replacing the Nym client with the same identity', { reason })
+      const previousClient = mixnetClient
+      mixnetClient = null
+      if (previousClient) await shutDownClient(previousClient, 'replaced')
+      for (let attempt = 1; node.state === 'reconnecting'; attempt += 1) {
+        try {
+          const { address, ms } = await startClient('reconnect')
+          node.counters.reconnects += 1
+          const sameAddress = address === node.address
+          diagnostics.info('nym', 'reconnected', { attempt, ms, totalMs: Math.round(performance.now() - reconnectStartedAt), sameAddress })
+          if (!sameAddress) {
+            diagnostics.warn('nym', 'the Nym address changed while reconnecting', { previous: redactNymAddress(node.address), current: redactNymAddress(address) })
+            node.address = address
+          }
+          setState('connected')
+          setNetworkStatus('connected', 'Connected to Nym')
+          try { node.onReconnected?.({ sameAddress }) } catch (error) { diagnostics.error('nym', 'reconnect handler failed', error) }
+          return true
+        } catch (error) {
+          const delayMs = Math.min(NYM_RECONNECT_MAX_DELAY_MS, 2000 * 2 ** (attempt - 1))
+          diagnostics.warn('nym', 'reconnect attempt ' + attempt + ' failed; next try in ' + delayMs / 1000 + ' s', error)
+          setNetworkStatus('failed', 'Nym unavailable, retrying')
+          await new Promise(resolve => setTimeout(resolve, delayMs))
+        }
+      }
+      return false
+    })().finally(() => { reconnectPromise = null })
+    return reconnectPromise
+  }
+
   const countOutgoing = payload => {
     if (payload[0] !== MESSAGE_KIND_DATA) return
     node.counters.dataFramesOut += 1
@@ -511,23 +664,25 @@ async function createNymNode (mode) {
   // Sends to a Nym address, attaching reply blocks so the other side can answer without
   // learning this client's address.
   node.send = async (payload, recipient) => {
-    countOutgoing(payload)
     try {
+      await waitUntilUsable()
+      countOutgoing(payload)
       await mixnetClient.client.rawSend({ payload, recipient, replySurbs: RECIPIENT_REPLY_SURBS_PER_MESSAGE })
     } catch (error) {
       node.counters.sendFailures += 1
-      diagnostics.error('nym', 'send failed', { to: redactNymAddress(recipient), bytes: payload.length, error })
+      diagnostics.error('nym', 'send failed', { to: redactNymAddress(recipient), bytes: payload.length, nodeState: node.state, error })
       throw error
     }
   }
   // Answers a message through the reply blocks that came with it. Only the tag is needed.
   node.reply = async (payload, senderTag) => {
-    countOutgoing(payload)
     try {
+      await waitUntilUsable()
+      countOutgoing(payload)
       await mixnetClient.client.rawReply({ payload, senderTag })
     } catch (error) {
       node.counters.sendFailures += 1
-      diagnostics.error('nym', 'reply failed', { replyTag: describeReplyTag(senderTag), bytes: payload.length, error })
+      diagnostics.error('nym', 'reply failed', { replyTag: describeReplyTag(senderTag), bytes: payload.length, nodeState: node.state, error })
       throw error
     }
   }
@@ -541,9 +696,18 @@ async function createNymNode (mode) {
     diagnostics.info('control', 'replying ' + message.kind, Object.assign(describeControlMessage(message), { replyTag: describeReplyTag(senderTag) }))
     return node.reply(encodeControlMessage(message), senderTag)
   }
+  // Test hook, reachable only through the ?faults=1 controls.
+  node.closeGatewaySocketsForTest = async () => (mixnetClient ? mixnetClient.client.wymCloseGatewaySockets() : 0)
   node.stop = async () => {
     diagnostics.info('nym', 'stopping client', node.counters)
-    try { await mixnetClient.client.stop?.() } catch (error) { diagnostics.warn('nym', 'client stop failed', error) }
+    setState('stopped')
+    clearTimeout(socketGraceTimer)
+    socketGraceTimer = null
+    clientGeneration += 1
+    for (const waiter of usableWaiters) clearTimeout(waiter.timer)
+    usableWaiters = []
+    if (mixnetClient) await shutDownClient(mixnetClient, 'stopped')
+    mixnetClient = null
     // A stopped client's keys are never reused, so release its heartbeat and delete them now.
     stopHeartbeat()
     indexedDB.deleteDatabase(NYM_STORAGE_PREFIX + clientId)
@@ -790,13 +954,49 @@ function parseShareLink (link) {
 }
 
 // ---------------------------------------------------------------------------
+// Screen wake lock
+// ---------------------------------------------------------------------------
+// While this tab is sending or receiving, a sleeping screen can suspend it and drop its Nym
+// connection. Browsers release the lock whenever the tab is hidden, so it is requested again
+// each time the tab becomes visible while it is still wanted.
+const wakeLock = { wantedBy: new Set(), sentinel: null }
+async function acquireWakeLock (reason) {
+  wakeLock.wantedBy.add(reason)
+  if (!('wakeLock' in navigator)) {
+    diagnostics.info('env', 'screen wake lock not supported by this browser')
+    return
+  }
+  if (wakeLock.sentinel || document.visibilityState !== 'visible') return
+  try {
+    wakeLock.sentinel = await navigator.wakeLock.request('screen')
+    diagnostics.info('env', 'screen wake lock acquired', { for: [...wakeLock.wantedBy] })
+    wakeLock.sentinel.addEventListener('release', () => {
+      wakeLock.sentinel = null
+      diagnostics.info('env', 'screen wake lock released', { stillWanted: wakeLock.wantedBy.size > 0 })
+    })
+  } catch (error) {
+    diagnostics.warn('env', 'screen wake lock refused', error)
+  }
+}
+function releaseWakeLock (reason) {
+  wakeLock.wantedBy.delete(reason)
+  if (wakeLock.wantedBy.size === 0 && wakeLock.sentinel) wakeLock.sentinel.release().catch(() => {})
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && wakeLock.wantedBy.size > 0 && !wakeLock.sentinel) acquireWakeLock([...wakeLock.wantedBy][0])
+})
+
+// ---------------------------------------------------------------------------
 // Sender
 // ---------------------------------------------------------------------------
 // framesAwaitingLink: the mixnet reorders messages, so a receiver's first data frames can
 // arrive before its "open" control message. They are held here until the link opens.
-// closedLinkIds: links closed after a recipient finished. The same reordering can deliver
-// that recipient's last frames after "complete"; they are counted and dropped, not held.
-const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Set(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null }
+// closedLinkIds: links that were closed (finished, replaced or closed by the recipient). The same
+// reordering can deliver their last frames afterwards; those are counted and dropped, not held.
+// recipients: recipient id -> { linkIds }. The id is a random value each recipient chooses for its
+// session and only shares with this sender, so a recipient that reconnects keeps its slot under
+// the recipient limit. Like the link itself, it identifies a session, not a person.
+const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null, linkFields: null }
 const FRAMES_AWAITING_LINK_TTL_MS = 60000
 
 function routeSenderFrame (frame, senderTag) {
@@ -914,17 +1114,20 @@ async function startSharing (fileList) {
     diagnostics.info('send', 'seeding', { infoHash: sendSession.torrent.infoHash.slice(0, 8), pieces: sendSession.torrent.pieces.length, pieceLength: sendSession.torrent.pieceLength })
 
     const saltBytes = Uint8Array.from(atob(keychain.saltB64), character => character.charCodeAt(0))
-    const shareLink = buildShareLink({
+    sendSession.linkFields = {
       mode: sendSession.mode,
       senderAddress: sendSession.node.address,
       infoHash: sendSession.torrent.infoHash,
       keyB64Url: keychain.keyB64,
       saltB64Url: bytesToBase64Url(saltBytes),
       encryptedListB64Url: bytesToBase64Url(encryptedList)
-    })
+    }
+    const shareLink = buildShareLink(sendSession.linkFields)
 
     sendSession.node.onControl = (message, senderTag) => handleSenderControl(message, senderTag)
     sendSession.node.onData = (frame, senderTag) => routeSenderFrame(frame, senderTag)
+    sendSession.node.onReconnected = ({ sameAddress }) => handleSenderReconnected(sameAddress)
+    acquireWakeLock('sharing')
 
     elementById('share-link').value = shareLink
     sendSession.qrDataUrl = null
@@ -938,6 +1141,7 @@ async function startSharing (fileList) {
       uploaded: sendSession.torrent?.uploaded,
       recipients: sendSession.recipients.size,
       finished: sendSession.finished.size,
+      nymState: sendSession.node?.state,
       framesAwaitingLink: sendSession.framesAwaitingLink.size,
       lateFramesDropped: sendSession.lateFramesDropped,
       nym: sendSession.node?.counters,
@@ -953,7 +1157,7 @@ async function startSharing (fileList) {
 // Recipients announce themselves with "hello", then open a link for the transfer. Every answer
 // goes back through the reply blocks attached to the recipient's message, identified by its
 // reply tag, so the sender never learns where the recipient is. A message without a tag cannot
-// be answered and is ignored.
+// be answered, and one without a recipient id cannot be counted; both are ignored.
 function handleSenderControl (message, senderTag) {
   const torrent = sendSession.torrent
   if (!torrent) {
@@ -968,19 +1172,31 @@ function handleSenderControl (message, senderTag) {
     diagnostics.warn('send', 'control message without reply blocks ignored', describeControlMessage(message))
     return
   }
-  const limitReached = sendSession.recipientLimit > 0 && sendSession.recipients.size >= sendSession.recipientLimit && !sendSession.recipients.has(senderTag)
+  const recipientId = typeof message.recipientId === 'string' && RECIPIENT_ID_PATTERN.test(message.recipientId) ? message.recipientId : null
+  if (!recipientId) {
+    diagnostics.warn('send', 'control message without a recipient id ignored', describeControlMessage(message))
+    return
+  }
+  const knownRecipient = sendSession.recipients.has(recipientId)
+  const limitReached = sendSession.recipientLimit > 0 && sendSession.recipients.size >= sendSession.recipientLimit && !knownRecipient
+  const linkId = typeof message.linkId === 'string' && /^[0-9a-f]{32}$/.test(message.linkId) ? message.linkId : null
 
   if (message.kind === 'hello') {
-    sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined }, senderTag)
-  } else if (message.kind === 'open' && typeof message.linkId === 'string' && /^[0-9a-f]{32}$/.test(message.linkId)) {
+    sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined }, senderTag).catch(() => {})
+  } else if (message.kind === 'open' && linkId) {
     if (limitReached) {
-      sendSession.node.replyControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, senderTag)
+      sendSession.node.replyControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, senderTag).catch(() => {})
       return
     }
-    if (sendSession.links.has(message.linkId)) {
-      diagnostics.info('send', 'duplicate open ignored', { link: message.linkId.slice(0, 8) })
+    if (sendSession.links.has(linkId) || sendSession.closedLinkIds.has(linkId)) {
+      diagnostics.info('send', 'duplicate open ignored', { link: linkId.slice(0, 8) })
       return
     }
+    const recipient = sendSession.recipients.get(recipientId) ?? { linkIds: new Set() }
+    sendSession.recipients.set(recipientId, recipient)
+    // A recipient reopening after a stall gets a fresh link; its old one is dead, so retire it
+    // now in case the recipient's "close" message is still in flight or was lost.
+    for (const previousLinkId of [...recipient.linkIds]) retireSenderLink(previousLinkId, 'replaced by a new link from the same recipient')
     const LinkStream = sendSession.LinkStream ?? (sendSession.LinkStream = createLinkStreamClass())
     const node = sendSession.node
     const route = {
@@ -988,31 +1204,65 @@ function handleSenderControl (message, senderTag) {
       senderTag,
       send (frame) { return node.reply(frame, route.senderTag) }
     }
-    const link = new LinkStream(route, hexToBytes(message.linkId))
-    sendSession.links.set(message.linkId, link)
-    sendSession.recipients.add(senderTag)
+    const link = new LinkStream(route, hexToBytes(linkId))
+    link.recipientId = recipientId
+    sendSession.links.set(linkId, link)
+    recipient.linkIds.add(linkId)
     const added = torrent.addPeer(link)
-    diagnostics.info('send', 'recipient link added to torrent', { link: message.linkId.slice(0, 8), added, recipients: sendSession.recipients.size })
-    const waiting = sendSession.framesAwaitingLink.get(message.linkId)
+    diagnostics.info('send', 'recipient link added to torrent', { link: linkId.slice(0, 8), added, recipients: sendSession.recipients.size, returningRecipient: knownRecipient })
+    const waiting = sendSession.framesAwaitingLink.get(linkId)
     if (waiting) {
-      sendSession.framesAwaitingLink.delete(message.linkId)
-      diagnostics.info('link', 'replaying held frames', { link: message.linkId.slice(0, 8), frames: waiting.frames.length })
+      sendSession.framesAwaitingLink.delete(linkId)
+      diagnostics.info('link', 'replaying held frames', { link: linkId.slice(0, 8), frames: waiting.frames.length })
       for (const frame of waiting.frames) link.receiveFrame(frame)
     }
+  } else if (message.kind === 'close' && linkId) {
+    if (sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'closed by the recipient')
   } else if (message.kind === 'complete') {
-    sendSession.finished.add(senderTag)
+    sendSession.finished.add(recipientId)
     diagnostics.info('send', 'recipient finished', { finished: sendSession.finished.size, verified: message.verified })
     // The recipient has destroyed its side, but nothing travels back over the mixnet to tell
     // this link stream. Close it here so the wire, the Connected count and the logs settle.
-    const link = typeof message.linkId === 'string' ? sendSession.links.get(message.linkId) : null
-    if (link) {
-      sendSession.links.delete(message.linkId)
-      sendSession.closedLinkIds.add(message.linkId)
-      link.destroy()
-    }
+    if (linkId && sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'recipient finished')
   } else {
     diagnostics.warn('send', 'unexpected control message', describeControlMessage(message))
   }
+}
+
+function retireSenderLink (linkId, reason) {
+  const link = sendSession.links.get(linkId)
+  if (!link) return
+  sendSession.links.delete(linkId)
+  sendSession.closedLinkIds.add(linkId)
+  sendSession.recipients.get(link.recipientId)?.linkIds.delete(linkId)
+  diagnostics.info('send', 'link retired', { link: linkId.slice(0, 8), reason })
+  link.destroy()
+}
+
+// The node reconnects under the same identity, so the address normally stays the same and the
+// link already shared keeps working. If it ever changes, the old link is dead: show a new one.
+function handleSenderReconnected (sameAddress) {
+  if (!sendSession.torrent || !sendSession.linkFields) return
+  if (sameAddress) {
+    diagnostics.info('send', 'reachable again at the same address; the shared link still works')
+    hideShareNotice()
+    return
+  }
+  sendSession.linkFields.senderAddress = sendSession.node.address
+  const shareLink = buildShareLink(sendSession.linkFields)
+  elementById('share-link').value = shareLink
+  sendSession.qrDataUrl = null
+  elementById('qr-image').classList.add('hidden')
+  diagnostics.warn('send', 'share link replaced after the Nym address changed', { linkCharacters: shareLink.length })
+  showShareNotice('Your Nym connection was replaced and the old link no longer works. Send this new link instead.')
+}
+
+function showShareNotice (text) {
+  elementById('share-notice-text').textContent = text
+  elementById('share-notice').classList.remove('hidden')
+}
+function hideShareNotice () {
+  elementById('share-notice').classList.add('hidden')
 }
 
 function startSenderStats () {
@@ -1052,14 +1302,17 @@ function warnBeforeLeaving (event) {
 async function stopSharing () {
   diagnostics.info('send', 'stopping', { uploaded: sendSession.torrent?.uploaded, recipients: sendSession.recipients.size, finished: sendSession.finished.size, links: describeLinks(sendSession.links.values()) })
   window.removeEventListener('beforeunload', warnBeforeLeaving)
+  releaseWakeLock('sharing')
+  hideShareNotice()
   clearInterval(sendSession.statsTimer)
   sendSession.stopSnapshots?.()
   if (sendSession.client) await new Promise(resolve => sendSession.client.destroy(resolve))
   if (sendSession.node) {
     sendSession.node.onControl = null
     sendSession.node.onData = null
+    sendSession.node.onReconnected = null
   }
-  Object.assign(sendSession, { torrent: null, client: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Set(), finished: new Set(), qrDataUrl: null, stopSnapshots: null })
+  Object.assign(sendSession, { torrent: null, client: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), qrDataUrl: null, stopSnapshots: null, linkFields: null })
   diagnostics.info('send', 'stopped')
   elementById('share-ready').classList.add('hidden')
   elementById('qr-image').classList.add('hidden')
@@ -1072,7 +1325,14 @@ async function stopSharing () {
 // ---------------------------------------------------------------------------
 // Receiver
 // ---------------------------------------------------------------------------
-const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, results: null, replyTimer: null, statsTimer: null }
+// recipientId: random per receiving session; the sender counts it against the recipient limit
+// and lets it reopen links after a stall. retiredLinkIds: links replaced after a stall, whose
+// late frames are dropped. stall: the recovery state (see checkReceiverHealth).
+const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null }
+
+function newStallState () {
+  return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0 }
+}
 
 async function openShareLink (linkText) {
   const link = parseShareLink(linkText)
@@ -1114,14 +1374,12 @@ async function openShareLink (linkText) {
     showReceiveNotice('error', error.message)
     return
   }
+  receiveSession.recipientId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
   receiveSession.node.onControl = (message, senderTag) => handleReceiverControl(message, senderTag)
-  receiveSession.node.onData = frame => {
-    if (receiveSession.linkStream) receiveSession.linkStream.receiveFrame(frame)
-    else diagnostics.warn('link', 'data frame arrived with no open link; dropped', { bytes: frame.length })
-  }
+  receiveSession.node.onData = frame => routeReceiverFrame(frame)
   receiveSession.helloSentAt = performance.now()
   // No return address: the sender answers through the reply blocks attached to this message.
-  receiveSession.node.sendControl({ kind: 'hello', infoHash: link.infoHash }, link.senderAddress)
+  receiveSession.node.sendControl({ kind: 'hello', infoHash: link.infoHash, recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
   clearTimeout(receiveSession.replyTimer)
   receiveSession.replyTimer = setTimeout(() => {
     diagnostics.warn('receive', 'sender did not answer within ' + SENDER_REPLY_TIMEOUT_MS / 1000 + ' s')
@@ -1136,6 +1394,17 @@ function handleReceiverControl (message) {
     return
   }
   const replyMs = receiveSession.helloSentAt ? Math.round(performance.now() - receiveSession.helloSentAt) : null
+  if (message.kind === 'available' && receiveSession.downloading) {
+    // An answer to a sender check made during a stall: the sender is up, so open a fresh link.
+    if (receiveSession.stall.stage === 'checking-sender') {
+      diagnostics.info('receive', 'sender answered during a stall; opening a new link', { roundTripMs: replyMs, senderChecks: receiveSession.stall.senderChecks })
+      receiveSession.stall.stage = 'relinked'
+      receiveSession.stall.relinks += 1
+      showReceiveNotice('warning', 'The sender is online again. Resuming the transfer.')
+      openReceiverLink('sender answered after a stall')
+    }
+    return
+  }
   if (message.kind === 'available') {
     clearTimeout(receiveSession.replyTimer)
     diagnostics.info('receive', 'sender is online', { roundTripMs: replyMs })
@@ -1144,6 +1413,11 @@ function handleReceiverControl (message) {
     elementById('start-download').disabled = false
   } else if (message.kind === 'refused') {
     clearTimeout(receiveSession.replyTimer)
+    if (receiveSession.downloading) {
+      receiveSession.downloading = false
+      clearInterval(receiveSession.monitorTimer)
+      releaseWakeLock('receiving')
+    }
     diagnostics.warn('receive', 'sender refused', { reason: message.reason, roundTripMs: replyMs })
     elementById('start-download').disabled = true
     showReceiveNotice('error', message.reason === 'limit' ? 'The sender set a recipient limit, and it has been reached.' : 'The sender refused the connection.')
@@ -1175,13 +1449,12 @@ async function startDownload () {
   widenRequestWindow(torrent)
   await new Promise(resolve => torrent.infoHash ? resolve() : torrent.once('infoHash', resolve))
 
-  const LinkStream = createLinkStreamClass()
-  const linkIdBytes = crypto.getRandomValues(new Uint8Array(LINK_ID_BYTES))
-  const node = receiveSession.node
-  receiveSession.linkStream = new LinkStream({ label: redactNymAddress(link.senderAddress), send: frame => node.send(frame, link.senderAddress) }, linkIdBytes)
-  receiveSession.node.sendControl({ kind: 'open', infoHash: link.infoHash, linkId: bytesToHex(linkIdBytes) }, link.senderAddress)
-  const added = torrent.addPeer(receiveSession.linkStream)
-  diagnostics.info('receive', 'link added to torrent', { added })
+  receiveSession.downloading = true
+  receiveSession.stall = newStallState()
+  openReceiverLink('download started')
+  acquireWakeLock('receiving')
+  clearInterval(receiveSession.monitorTimer)
+  receiveSession.monitorTimer = setInterval(checkReceiverHealth, STALL_CHECK_INTERVAL_MS)
   receiveSession.stopSnapshots = startSnapshots('receiver', () => ({
     progress: Number(torrent.progress.toFixed(4)),
     downloaded: torrent.downloaded,
@@ -1189,6 +1462,8 @@ async function startDownload () {
     peers: torrent.numPeers,
     requestsInFlight: torrent.wires.reduce((sum, wire) => sum + wire.requests.length, 0),
     peerChoking: torrent.wires.map(wire => wire.peerChoking),
+    nymState: receiveSession.node.state,
+    stall: Object.assign({ quietMs: Date.now() - receiveSession.lastDataAt, linkGeneration: receiveSession.linkGeneration, lateFramesDropped: receiveSession.lateFramesDropped }, receiveSession.stall),
     nym: receiveSession.node.counters,
     links: describeLinks([receiveSession.linkStream])
   }))
@@ -1207,15 +1482,109 @@ async function startDownload () {
   torrent.once('done', () => finishDownload(torrent))
 }
 
+// Opens a link to the sender and adds it to the torrent as a peer. A link that already exists
+// (one that stalled) is retired first: the sender is told to close it, and any of its frames
+// still in the mixnet are dropped on arrival. WebTorrent keeps every verified piece and
+// re-requests whatever the old link had in flight.
+function openReceiverLink (reason) {
+  const node = receiveSession.node
+  const link = receiveSession.link
+  const previous = receiveSession.linkStream
+  if (previous) {
+    const previousLinkId = bytesToHex(previous.linkIdBytes)
+    receiveSession.retiredLinkIds.add(previousLinkId)
+    node.sendControl({ kind: 'close', infoHash: link.infoHash, linkId: previousLinkId, recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
+    previous.destroy()
+  }
+  receiveSession.LinkStream = receiveSession.LinkStream ?? createLinkStreamClass()
+  const linkIdBytes = crypto.getRandomValues(new Uint8Array(LINK_ID_BYTES))
+  receiveSession.linkGeneration += 1
+  receiveSession.linkStream = new receiveSession.LinkStream({ label: redactNymAddress(link.senderAddress), send: frame => node.send(frame, link.senderAddress) }, linkIdBytes)
+  receiveSession.lastDataAt = Date.now()
+  node.sendControl({ kind: 'open', infoHash: link.infoHash, linkId: bytesToHex(linkIdBytes), recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
+  const added = receiveSession.torrent.addPeer(receiveSession.linkStream)
+  diagnostics.info('receive', 'link added to torrent', { added, reason, linkGeneration: receiveSession.linkGeneration })
+}
+
+function routeReceiverFrame (frame) {
+  const linkIdHex = bytesToHex(frame.subarray(1, 1 + LINK_ID_BYTES))
+  const current = receiveSession.linkStream
+  if (current && linkIdHex === bytesToHex(current.linkIdBytes)) {
+    noteReceiverData()
+    current.receiveFrame(frame)
+    return
+  }
+  if (receiveSession.retiredLinkIds.has(linkIdHex)) {
+    receiveSession.lateFramesDropped += 1
+    return
+  }
+  diagnostics.warn('link', 'data frame for an unknown link dropped', { link: linkIdHex.slice(0, 8), bytes: frame.length })
+}
+
+function noteReceiverData () {
+  receiveSession.lastDataAt = Date.now()
+  const stall = receiveSession.stall
+  if (!stall || stall.stage === 'healthy') return
+  diagnostics.info('receive', 'transfer resumed', { pausedMs: Date.now() - stall.stalledAt, relinks: stall.relinks, senderChecks: stall.senderChecks, linkGeneration: receiveSession.linkGeneration })
+  stall.stage = 'healthy'
+  hideReceiveNotice()
+  elementById('receive-subtitle').textContent = 'Receiving the encrypted files through the Nym mixnet.'
+}
+
+// Runs every STALL_CHECK_INTERVAL_MS while downloading. While this page's own Nym client is
+// reconnecting, the node handles recovery and the stall clock is not acted on.
+function checkReceiverHealth () {
+  if (!receiveSession.downloading || !receiveSession.stall) return
+  const node = receiveSession.node
+  if (node.state !== 'connected') return
+  const stall = receiveSession.stall
+  const now = Date.now()
+  const quietMs = now - receiveSession.lastDataAt
+  const torrent = receiveSession.torrent
+  const transferState = () => ({
+    quietSeconds: Math.round(quietMs / 1000),
+    progress: Number(torrent.progress.toFixed(4)),
+    hasMetadata: Boolean(torrent.metadata),
+    requestsInFlight: torrent.wires.reduce((sum, wire) => sum + wire.requests.length, 0),
+    linkGeneration: receiveSession.linkGeneration
+  })
+
+  if (stall.stage === 'healthy' && quietMs >= STALL_RELINK_AFTER_MS) {
+    stall.stage = 'relinked'
+    stall.stalledAt = receiveSession.lastDataAt
+    stall.relinks += 1
+    diagnostics.warn('receive', 'no data for ' + Math.round(quietMs / 1000) + ' s; opening a new link', transferState())
+    showReceiveNotice('warning', 'The transfer paused. Reconnecting to the sender.')
+    openReceiverLink('stalled')
+    return
+  }
+  if (stall.stage !== 'healthy' && quietMs >= STALL_SENDER_CHECK_AFTER_MS && now - stall.lastSenderCheckAt >= STALL_SENDER_CHECK_INTERVAL_MS) {
+    stall.stage = 'checking-sender'
+    stall.lastSenderCheckAt = now
+    stall.senderChecks += 1
+    diagnostics.warn('receive', 'still no data; checking whether the sender is online', Object.assign({ senderChecks: stall.senderChecks }, transferState()))
+    showReceiveNotice('warning', 'Waiting for the sender. Their tab may be closed, asleep or offline. This page keeps trying.')
+    receiveSession.helloSentAt = performance.now()
+    node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId }, receiveSession.link.senderAddress).catch(() => {})
+  }
+}
+
 async function finishDownload (torrent) {
+  receiveSession.downloading = false
+  clearInterval(receiveSession.monitorTimer)
   clearInterval(receiveSession.statsTimer)
   receiveSession.stopSnapshots?.()
+  releaseWakeLock('receiving')
+  hideReceiveNotice()
   const transferSeconds = (performance.now() - receiveSession.downloadStartedAt) / 1000
   diagnostics.info('receive', 'transfer complete', {
     seconds: Number(transferSeconds.toFixed(1)),
     encryptedBytes: torrent.length,
     averageKBps: Number((torrent.length / 1000 / transferSeconds).toFixed(1)),
     links: describeLinks([receiveSession.linkStream]),
+    relinks: receiveSession.stall.relinks,
+    senderChecks: receiveSession.stall.senderChecks,
+    lateFramesDropped: receiveSession.lateFramesDropped,
     nym: receiveSession.node.counters
   })
   elementById('receive-progress').style.width = '100%'
@@ -1242,7 +1611,7 @@ async function finishDownload (torrent) {
     }
     receiveSession.results = results
     const allVerified = results.every(result => result.verified)
-    receiveSession.node.sendControl({ kind: 'complete', infoHash: receiveSession.link.infoHash, linkId: bytesToHex(receiveSession.linkStream.linkIdBytes), verified: allVerified }, receiveSession.link.senderAddress)
+    receiveSession.node.sendControl({ kind: 'complete', infoHash: receiveSession.link.infoHash, linkId: bytesToHex(receiveSession.linkStream.linkIdBytes), recipientId: receiveSession.recipientId, verified: allVerified }, receiveSession.link.senderAddress).catch(() => {})
 
     setReceiveHeading(allVerified ? 'Ready to save' : 'Integrity check failed', allVerified ? 'Every file was decrypted and matches what the sender shared.' : 'At least one file does not match what the sender shared. Do not trust it.')
     renderFileRows(elementById('receive-file-list'), receiveSession.files, { verified: results.map(result => result.verified), onSave: saveFile })
@@ -1387,7 +1756,28 @@ function wireUserInterface () {
   })
 }
 
-diagnostics.info('diag', 'page loaded', { session: SESSION_ID, pageVersion: PAGE_VERSION })
+diagnostics.info('diag', 'page loaded', { session: SESSION_ID, pageVersion: PAGE_VERSION, faultInjection: FAULT_INJECTION_ENABLED })
+if (FAULT_INJECTION_ENABLED) {
+  // Test controls for recovery. Each action is logged so test logs show exactly what was injected.
+  window.nymShareFaults = {
+    dropIncomingData (seconds) {
+      faultInjection.dropIncomingDataUntil = Date.now() + seconds * 1000
+      diagnostics.warn('fault', 'dropping all incoming data frames', { seconds })
+    },
+    async closeGatewaySockets () {
+      const node = await nymNodePromise
+      const closed = await node.closeGatewaySocketsForTest()
+      diagnostics.warn('fault', 'closed this client\'s gateway connections', { closed })
+      return closed
+    },
+    async replaceNymClient () {
+      const node = await nymNodePromise
+      diagnostics.warn('fault', 'replacing the Nym client on request')
+      return node.reconnect('fault injection')
+    }
+  }
+  diagnostics.warn('fault', 'fault injection controls enabled through ?faults=1')
+}
 logEnvironment()
 wireUserInterface()
 renderIcons()
