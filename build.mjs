@@ -2,6 +2,7 @@
   build.mjs
   Purpose: builds docs/index.html, the single self-contained page GitHub Pages serves.
   It bundles src/app.js together with every library it imports (pinned in package-lock.json),
+  applies build/nym-reply-patch.mjs to the Nym SDK so replies can use reply blocks,
   inlines the bundle into src/page.html, and writes docs/SHA256SUMS so anyone can check that
   the page they loaded matches a build from this repository. The output does not depend on
   the time or machine of the build, so running it again from the same commit must reproduce
@@ -9,6 +10,7 @@
   Created: 2026-11-14
 */
 import { build } from 'esbuild'
+import { nymReplyPatchPlugin } from './build/nym-reply-patch.mjs'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 
@@ -33,6 +35,7 @@ const bundleResult = await build({
   charset: 'utf8',
   legalComments: 'eof',
   define: { PAGE_VERSION: JSON.stringify(packageManifest.version) },
+  plugins: [nymReplyPatchPlugin()],
   logLevel: 'warning'
 })
 let bundledScript = bundleResult.outputFiles[0].text

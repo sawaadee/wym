@@ -18,7 +18,7 @@ The share link carries everything a recipient needs after the `#`: the sender's 
 
 - File contents and names are encrypted end to end. Only someone with the link can read them.
 - Neither side learns the other's IP address. Each side's Nym entry node (gateway) sees that side's IP, but not who it is talking to.
-- The recipient currently sends its own Nym address to the sender. That address identifies the recipient's gateway, not its IP.
+- The sender never learns the recipient's Nym address. The recipient attaches single-use reply blocks to its messages, and the sender answers only through those. The recipient does learn the sender's Nym address, from the link.
 - The sender's tab has to stay open until recipients finish. There is no cloud copy.
 - Throughput through the mixnet is low. In testing, a 1 MB file took about 40 seconds.
 
@@ -33,7 +33,7 @@ npm ci
 npm run build
 ```
 
-`build.mjs` bundles `src/app.js` with every library it imports, at the versions pinned in `package-lock.json`, and inlines the result into `src/page.html`. The output is a single file, `docs/index.html`, which loads nothing from a CDN at runtime.
+`build.mjs` bundles `src/app.js` with every library it imports, at the versions pinned in `package-lock.json`, and inlines the result into `src/page.html`. It also applies `build/nym-reply-patch.mjs` to the Nym SDK, whose web worker otherwise drops the tag needed to answer through reply blocks; the build stops if the SDK version or the patched code changes. The output is a single file, `docs/index.html`, which loads nothing from a CDN at runtime.
 
 ## Verifying a build
 

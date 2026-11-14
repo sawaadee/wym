@@ -1,6 +1,6 @@
 {
   "name": "wym",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "End-to-end encrypted file sharing in the browser where neither side learns the other's IP address.",
   "type": "module",
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@nymproject/sdk-full-fat": "1.4.1",
-    "buffer": "6.0.3",
     "events": "3.3.0",
     "lucide": "1.72.0",
     "qrcode": "1.5.4",

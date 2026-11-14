@@ -60,6 +60,10 @@ const MESSAGE_KIND_DATA = 2
 const LINK_ID_BYTES = 16
 const DATA_HEADER_BYTES = 1 + LINK_ID_BYTES + 4
 const MAX_NYM_MESSAGE_BYTES = 32768
+// Reply blocks (SURBs) the recipient attaches to each message it sends. The sender answers only
+// through these, so it never learns the recipient's Nym address. Each one carries one reply
+// packet; when the sender runs short, its Nym client asks the recipient's client for more.
+const RECIPIENT_REPLY_SURBS_PER_MESSAGE = 10
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -337,8 +341,12 @@ function describeControlMessage (message) {
   if (typeof message?.linkId === 'string') description.linkId = message.linkId.slice(0, 8)
   if (message?.reason !== undefined) description.reason = message.reason
   if (message?.verified !== undefined) description.verified = message.verified
-  if (message?.from) description.from = redactNymAddress(message.from)
   return description
+}
+
+/** Shortens a reply tag for the log. A tag identifies a conversation, not a person or address. */
+function describeReplyTag (senderTag) {
+  return typeof senderTag === 'string' ? senderTag.slice(0, 6) + '...' : null
 }
 
 // ---------------------------------------------------------------------------
@@ -435,12 +443,15 @@ async function createNymNode (mode) {
   }
 
   mixnetClient.events.subscribeToConnected(event => { node.address = event.args.address })
+  // senderTag is set when the message carried reply blocks (see build/nym-reply-patch.mjs),
+  // and null for replies, which carry none.
   mixnetClient.events.subscribeToRawMessageReceivedEvent(event => {
     const payload = event.args.payload
+    const senderTag = typeof event.args.senderTag === 'string' ? event.args.senderTag : null
     if (payload[0] === MESSAGE_KIND_DATA) {
       node.counters.dataFramesIn += 1
       node.counters.dataBytesIn += payload.length
-      node.onData?.(payload)
+      node.onData?.(payload, senderTag)
       return
     }
     if (payload[0] !== MESSAGE_KIND_CONTROL) {
@@ -456,9 +467,9 @@ async function createNymNode (mode) {
       return
     }
     node.counters.controlIn += 1
-    diagnostics.info('control', 'received ' + message?.kind, describeControlMessage(message))
+    diagnostics.info('control', 'received ' + message?.kind, Object.assign(describeControlMessage(message), { replyTag: describeReplyTag(senderTag) }))
     try {
-      node.onControl?.(message)
+      node.onControl?.(message, senderTag)
     } catch (error) {
       diagnostics.error('control', 'handler failed for ' + message?.kind, error)
     }
@@ -492,16 +503,31 @@ async function createNymNode (mode) {
   diagnostics.info('nym', 'connected', { address: redactNymAddress(node.address), ms: Math.round(performance.now() - startedAt) })
 
   node.mode = mode
+  const countOutgoing = payload => {
+    if (payload[0] !== MESSAGE_KIND_DATA) return
+    node.counters.dataFramesOut += 1
+    node.counters.dataBytesOut += payload.length
+  }
+  // Sends to a Nym address, attaching reply blocks so the other side can answer without
+  // learning this client's address.
   node.send = async (payload, recipient) => {
-    if (payload[0] === MESSAGE_KIND_DATA) {
-      node.counters.dataFramesOut += 1
-      node.counters.dataBytesOut += payload.length
-    }
+    countOutgoing(payload)
     try {
-      await mixnetClient.client.rawSend({ payload, recipient })
+      await mixnetClient.client.rawSend({ payload, recipient, replySurbs: RECIPIENT_REPLY_SURBS_PER_MESSAGE })
     } catch (error) {
       node.counters.sendFailures += 1
       diagnostics.error('nym', 'send failed', { to: redactNymAddress(recipient), bytes: payload.length, error })
+      throw error
+    }
+  }
+  // Answers a message through the reply blocks that came with it. Only the tag is needed.
+  node.reply = async (payload, senderTag) => {
+    countOutgoing(payload)
+    try {
+      await mixnetClient.client.rawReply({ payload, senderTag })
+    } catch (error) {
+      node.counters.sendFailures += 1
+      diagnostics.error('nym', 'reply failed', { replyTag: describeReplyTag(senderTag), bytes: payload.length, error })
       throw error
     }
   }
@@ -509,6 +535,11 @@ async function createNymNode (mode) {
     node.counters.controlOut += 1
     diagnostics.info('control', 'sending ' + message.kind, Object.assign(describeControlMessage(message), { to: redactNymAddress(recipient) }))
     return node.send(encodeControlMessage(message), recipient)
+  }
+  node.replyControl = (message, senderTag) => {
+    node.counters.controlOut += 1
+    diagnostics.info('control', 'replying ' + message.kind, Object.assign(describeControlMessage(message), { replyTag: describeReplyTag(senderTag) }))
+    return node.reply(encodeControlMessage(message), senderTag)
   }
   node.stop = async () => {
     diagnostics.info('nym', 'stopping client', node.counters)
@@ -573,12 +604,13 @@ function getNymNode (mode) {
 function createLinkStreamClass () {
   const { Duplex } = libraries
   return class NymLinkStream extends Duplex {
-    constructor (node, remoteAddress, linkIdBytes) {
+    // route: { label, send(frame) } decides how frames reach the other side. The recipient
+    // sends to the sender's address; the sender replies through the recipient's reply tag.
+    constructor (route, linkIdBytes) {
       super()
       this.id = 'nym-link-' + bytesToHex(linkIdBytes) // WebTorrent's peer id for this connection
       this.connected = true // WebTorrent's WebRTC path treats the stream as already open
-      this.node = node
-      this.remoteNymAddress = remoteAddress
+      this.route = route
       this.linkIdBytes = linkIdBytes
       this.nextOutgoingSequence = 0
       this.nextExpectedSequence = 0
@@ -586,7 +618,7 @@ function createLinkStreamClass () {
       this.openedAt = performance.now()
       // Transport counters, reported in the periodic snapshots.
       this.stats = { framesOut: 0, bytesOut: 0, framesIn: 0, bytesIn: 0, outOfOrder: 0, duplicates: 0, maxPending: 0, highestSequenceSeen: -1, firstFrameInAtMs: null }
-      diagnostics.info('link', 'opened', { link: this.id.slice(9, 17), remote: redactNymAddress(remoteAddress) })
+      diagnostics.info('link', 'opened', { link: this.id.slice(9, 17), via: route.label })
       this.once('close', () => diagnostics.info('link', 'closed', Object.assign({ link: this.id.slice(9, 17) }, this.stats)))
     }
 
@@ -603,7 +635,7 @@ function createLinkStreamClass () {
         frame.set(body, DATA_HEADER_BYTES)
         this.stats.framesOut += 1
         this.stats.bytesOut += body.length
-        sends.push(this.node.send(frame, this.remoteNymAddress))
+        sends.push(this.route.send(frame))
       }
       Promise.all(sends).then(() => callback(null), error => {
         diagnostics.error('link', 'write failed', { link: this.id.slice(9, 17), error })
@@ -767,10 +799,16 @@ function parseShareLink (link) {
 const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Set(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null }
 const FRAMES_AWAITING_LINK_TTL_MS = 60000
 
-function routeSenderFrame (frame) {
+function routeSenderFrame (frame, senderTag) {
   const linkIdHex = bytesToHex(frame.subarray(1, 1 + LINK_ID_BYTES))
   const link = sendSession.links.get(linkIdHex)
   if (link) {
+    // Keep answering through the newest tag the recipient used, and record any change: the
+    // tag is expected to stay the same for one recipient's whole session.
+    if (senderTag && senderTag !== link.route.senderTag) {
+      diagnostics.warn('link', 'recipient reply tag changed', { link: linkIdHex.slice(0, 8), from: describeReplyTag(link.route.senderTag), to: describeReplyTag(senderTag) })
+      link.route.senderTag = senderTag
+    }
     link.receiveFrame(frame)
     return
   }
@@ -885,8 +923,8 @@ async function startSharing (fileList) {
       encryptedListB64Url: bytesToBase64Url(encryptedList)
     })
 
-    sendSession.node.onControl = message => handleSenderControl(message)
-    sendSession.node.onData = frame => routeSenderFrame(frame)
+    sendSession.node.onControl = (message, senderTag) => handleSenderControl(message, senderTag)
+    sendSession.node.onData = (frame, senderTag) => routeSenderFrame(frame, senderTag)
 
     elementById('share-link').value = shareLink
     sendSession.qrDataUrl = null
@@ -912,24 +950,31 @@ async function startSharing (fileList) {
   }
 }
 
-// Receivers announce themselves with "hello", then open a link for the transfer.
-function handleSenderControl (message) {
+// Recipients announce themselves with "hello", then open a link for the transfer. Every answer
+// goes back through the reply blocks attached to the recipient's message, identified by its
+// reply tag, so the sender never learns where the recipient is. A message without a tag cannot
+// be answered and is ignored.
+function handleSenderControl (message, senderTag) {
   const torrent = sendSession.torrent
   if (!torrent) {
     diagnostics.warn('send', 'control message while not sharing', describeControlMessage(message))
     return
   }
-  if (typeof message.from !== 'string' || message.infoHash !== torrent.infoHash) {
+  if (message.infoHash !== torrent.infoHash) {
     diagnostics.warn('send', 'control message for another share ignored', describeControlMessage(message))
     return
   }
-  const limitReached = sendSession.recipientLimit > 0 && sendSession.recipients.size >= sendSession.recipientLimit && !sendSession.recipients.has(message.from)
+  if (!senderTag) {
+    diagnostics.warn('send', 'control message without reply blocks ignored', describeControlMessage(message))
+    return
+  }
+  const limitReached = sendSession.recipientLimit > 0 && sendSession.recipients.size >= sendSession.recipientLimit && !sendSession.recipients.has(senderTag)
 
   if (message.kind === 'hello') {
-    sendSession.node.sendControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined }, message.from)
+    sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined }, senderTag)
   } else if (message.kind === 'open' && typeof message.linkId === 'string' && /^[0-9a-f]{32}$/.test(message.linkId)) {
     if (limitReached) {
-      sendSession.node.sendControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, message.from)
+      sendSession.node.replyControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, senderTag)
       return
     }
     if (sendSession.links.has(message.linkId)) {
@@ -937,9 +982,15 @@ function handleSenderControl (message) {
       return
     }
     const LinkStream = sendSession.LinkStream ?? (sendSession.LinkStream = createLinkStreamClass())
-    const link = new LinkStream(sendSession.node, message.from, hexToBytes(message.linkId))
+    const node = sendSession.node
+    const route = {
+      label: 'reply tag ' + describeReplyTag(senderTag),
+      senderTag,
+      send (frame) { return node.reply(frame, route.senderTag) }
+    }
+    const link = new LinkStream(route, hexToBytes(message.linkId))
     sendSession.links.set(message.linkId, link)
-    sendSession.recipients.add(message.from)
+    sendSession.recipients.add(senderTag)
     const added = torrent.addPeer(link)
     diagnostics.info('send', 'recipient link added to torrent', { link: message.linkId.slice(0, 8), added, recipients: sendSession.recipients.size })
     const waiting = sendSession.framesAwaitingLink.get(message.linkId)
@@ -949,16 +1000,14 @@ function handleSenderControl (message) {
       for (const frame of waiting.frames) link.receiveFrame(frame)
     }
   } else if (message.kind === 'complete') {
-    sendSession.finished.add(message.from)
+    sendSession.finished.add(senderTag)
     diagnostics.info('send', 'recipient finished', { finished: sendSession.finished.size, verified: message.verified })
     // The recipient has destroyed its side, but nothing travels back over the mixnet to tell
     // this link stream. Close it here so the wire, the Connected count and the logs settle.
-    // Match on linkId when the recipient sent one; older recipients only identify by address.
-    for (const [linkId, link] of sendSession.links) {
-      const matches = typeof message.linkId === 'string' ? linkId === message.linkId : link.remoteNymAddress === message.from
-      if (!matches) continue
-      sendSession.links.delete(linkId)
-      sendSession.closedLinkIds.add(linkId)
+    const link = typeof message.linkId === 'string' ? sendSession.links.get(message.linkId) : null
+    if (link) {
+      sendSession.links.delete(message.linkId)
+      sendSession.closedLinkIds.add(message.linkId)
       link.destroy()
     }
   } else {
@@ -1065,13 +1114,14 @@ async function openShareLink (linkText) {
     showReceiveNotice('error', error.message)
     return
   }
-  receiveSession.node.onControl = message => handleReceiverControl(message)
+  receiveSession.node.onControl = (message, senderTag) => handleReceiverControl(message, senderTag)
   receiveSession.node.onData = frame => {
     if (receiveSession.linkStream) receiveSession.linkStream.receiveFrame(frame)
     else diagnostics.warn('link', 'data frame arrived with no open link; dropped', { bytes: frame.length })
   }
   receiveSession.helloSentAt = performance.now()
-  receiveSession.node.sendControl({ kind: 'hello', infoHash: link.infoHash, from: receiveSession.node.address }, link.senderAddress)
+  // No return address: the sender answers through the reply blocks attached to this message.
+  receiveSession.node.sendControl({ kind: 'hello', infoHash: link.infoHash }, link.senderAddress)
   clearTimeout(receiveSession.replyTimer)
   receiveSession.replyTimer = setTimeout(() => {
     diagnostics.warn('receive', 'sender did not answer within ' + SENDER_REPLY_TIMEOUT_MS / 1000 + ' s')
@@ -1127,8 +1177,9 @@ async function startDownload () {
 
   const LinkStream = createLinkStreamClass()
   const linkIdBytes = crypto.getRandomValues(new Uint8Array(LINK_ID_BYTES))
-  receiveSession.linkStream = new LinkStream(receiveSession.node, link.senderAddress, linkIdBytes)
-  receiveSession.node.sendControl({ kind: 'open', infoHash: link.infoHash, linkId: bytesToHex(linkIdBytes), from: receiveSession.node.address }, link.senderAddress)
+  const node = receiveSession.node
+  receiveSession.linkStream = new LinkStream({ label: redactNymAddress(link.senderAddress), send: frame => node.send(frame, link.senderAddress) }, linkIdBytes)
+  receiveSession.node.sendControl({ kind: 'open', infoHash: link.infoHash, linkId: bytesToHex(linkIdBytes) }, link.senderAddress)
   const added = torrent.addPeer(receiveSession.linkStream)
   diagnostics.info('receive', 'link added to torrent', { added })
   receiveSession.stopSnapshots = startSnapshots('receiver', () => ({
@@ -1191,7 +1242,7 @@ async function finishDownload (torrent) {
     }
     receiveSession.results = results
     const allVerified = results.every(result => result.verified)
-    receiveSession.node.sendControl({ kind: 'complete', infoHash: receiveSession.link.infoHash, linkId: bytesToHex(receiveSession.linkStream.linkIdBytes), verified: allVerified, from: receiveSession.node.address }, receiveSession.link.senderAddress)
+    receiveSession.node.sendControl({ kind: 'complete', infoHash: receiveSession.link.infoHash, linkId: bytesToHex(receiveSession.linkStream.linkIdBytes), verified: allVerified }, receiveSession.link.senderAddress)
 
     setReceiveHeading(allVerified ? 'Ready to save' : 'Integrity check failed', allVerified ? 'Every file was decrypted and matches what the sender shared.' : 'At least one file does not match what the sender shared. Do not trust it.')
     renderFileRows(elementById('receive-file-list'), receiveSession.files, { verified: results.map(result => result.verified), onSave: saveFile })
