@@ -73,13 +73,20 @@ const RECIPIENT_REPLY_SURBS_PER_MESSAGE = 10
 const STALL_RELINK_AFTER_MS = 20000
 const STALL_SENDER_CHECK_AFTER_RELINK_MS = 15000
 const STALL_SENDER_CHECK_INTERVAL_MS = 20000
+// The three thresholds above are minimums. Between two Brave windows on one machine, messages took
+// 8 to 19 s each way, so a fixed 20 s would relink in a loop. Each threshold is raised to a
+// multiple of the slowest recent round trip to the sender, up to STALL_THRESHOLD_CAP_MS.
+const STALL_RELINK_ROUND_TRIPS = 3
+const STALL_SENDER_CHECK_ROUND_TRIPS = 2
+const STALL_THRESHOLD_CAP_MS = 180000
+const ROUND_TRIP_SAMPLES_KEPT = 5
 const STALL_CHECK_INTERVAL_MS = 2000
 const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
 
 // Fault injection for testing recovery, enabled only when the page is opened with ?faults=1.
 // It adds window.nymShareFaults; nothing else changes.
 const FAULT_INJECTION_ENABLED = new URLSearchParams(location.search).get('faults') === '1'
-const faultInjection = { dropIncomingDataUntil: 0 }
+const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0 }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -388,6 +395,12 @@ function describeReplyTag (senderTag) {
 // Most connects took 5 to 7 s in testing, one took 18.8 s, and attempts cut off at 20 s were
 // followed by retries that connected in 6 to 7 s, so a slow attempt gets 30 s before it is replaced.
 const NYM_CONNECT_ATTEMPT_TIMEOUT_MS = 30000
+// A connect that is visibly progressing is not abandoned at 30 s: in one log the gateway
+// registration took 22 s and its working connection opened 8 s before the cut-off. The deadline
+// moves to NYM_CONNECT_ACTIVITY_GRACE_MS after the latest gateway socket event, up to
+// NYM_CONNECT_ATTEMPT_MAX_MS in total.
+const NYM_CONNECT_ACTIVITY_GRACE_MS = 15000
+const NYM_CONNECT_ATTEMPT_MAX_MS = 60000
 const NYM_CONNECT_ATTEMPTS = 3
 // How long the Nym client gets to restore a lost gateway connection on its own before the node
 // replaces it, how long a send waits for a reconnecting client, and the longest pause between
@@ -494,6 +507,7 @@ async function createNymNode (mode) {
   let usableWaiters = []
   let socketGraceTimer = null
   let socketLostAt = 0
+  let lastSocketActivityAt = 0
   let reconnectPromise = null
 
   const setState = state => {
@@ -522,6 +536,11 @@ async function createNymNode (mode) {
   // senderTag is set when the message carried reply blocks (see build/nym-reply-patch.mjs),
   // and null for replies, which carry none.
   const handleRawMessage = event => {
+    // Test only: hold every incoming message to imitate a slow mixnet path (?faults=1).
+    if (faultInjection.incomingDelayMs > 0 && !event.faultDelayed) {
+      setTimeout(() => handleRawMessage(Object.assign({}, event, { faultDelayed: true })), faultInjection.incomingDelayMs)
+      return
+    }
     const payload = event.args.payload
     const senderTag = typeof event.args.senderTag === 'string' ? event.args.senderTag : null
     if (payload[0] === MESSAGE_KIND_DATA) {
@@ -559,6 +578,7 @@ async function createNymNode (mode) {
   // The Nym client retries a lost gateway connection by itself (10 attempts, 5 s apart). The
   // node gives it NYM_INTERNAL_RECONNECT_GRACE_MS before replacing the client.
   const handleSocketState = ({ state, code, wasClean, openSockets }) => {
+    lastSocketActivityAt = Date.now()
     if (state === 'open') {
       if (socketGraceTimer) {
         clearTimeout(socketGraceTimer)
@@ -612,17 +632,26 @@ async function createNymNode (mode) {
       throw error
     }
     diagnostics.info('nym', 'client started, waiting for gateway', { purpose, sameGatewayRequested: Boolean(preferredGateway), ms: Math.round(performance.now() - attemptStartedAt) })
-    const deadline = Date.now() + NYM_CONNECT_ATTEMPT_TIMEOUT_MS
-    while (!connectedAddress && Date.now() < deadline && generation === clientGeneration) await new Promise(resolve => setTimeout(resolve, 200))
+    const attemptStartedWall = Date.now()
+    const hardDeadline = attemptStartedWall + NYM_CONNECT_ATTEMPT_MAX_MS
+    const currentDeadline = () => Math.min(hardDeadline, Math.max(attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS, lastSocketActivityAt + NYM_CONNECT_ACTIVITY_GRACE_MS))
+    let extensionLogged = false
+    while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration) {
+      if (!extensionLogged && Date.now() > attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS) {
+        extensionLogged = true
+        diagnostics.info('nym', 'still connecting; the gateway connection is active, so waiting longer', { purpose, waitedMs: Date.now() - attemptStartedWall })
+      }
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
     if (generation !== clientGeneration || node.state === 'stopped') {
       // The node was stopped while this client was connecting; do not leave it running.
       await shutDownClient(candidate, purpose)
       throw new Error('The Nym client was stopped while connecting.')
     }
     if (!connectedAddress) {
-      diagnostics.warn('nym', 'no gateway connection within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' s; discarding this client', { purpose, mode })
+      diagnostics.warn('nym', 'no gateway connection after ' + Math.round((Date.now() - attemptStartedWall) / 1000) + ' s; discarding this client', { purpose, mode })
       await shutDownClient(candidate, purpose)
-      throw new Error('Could not connect to the Nym network within ' + NYM_CONNECT_ATTEMPT_TIMEOUT_MS / 1000 + ' seconds.')
+      throw new Error('Could not connect to the Nym network within ' + Math.round((Date.now() - attemptStartedWall) / 1000) + ' seconds.')
     }
     mixnetClient = candidate
     return { address: connectedAddress, ms: Math.round(performance.now() - attemptStartedAt) }
@@ -1356,7 +1385,28 @@ async function stopSharing () {
 // recipientId: random per receiving session; the sender counts it against the recipient limit
 // and lets it reopen links after a stall. retiredLinkIds: links replaced after a stall, whose
 // late frames are dropped. stall: the recovery state (see checkReceiverHealth).
-const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0 }
+const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0, helloSentAt: new Map(), roundTrips: [] }
+
+// Round-trip samples to the sender: each answered hello (matched by its attempt number) and the
+// time from opening a link to its first frame. The slowest recent sample sets the thresholds.
+function recordRoundTrip (source, milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return
+  const samples = receiveSession.roundTrips
+  samples.push(Math.round(milliseconds))
+  if (samples.length > ROUND_TRIP_SAMPLES_KEPT) samples.shift()
+  const thresholds = stallThresholds()
+  diagnostics.info('receive', 'round trip to the sender measured', Object.assign({ source, roundTripMs: Math.round(milliseconds), slowestRecentMs: Math.max(...samples) }, thresholds))
+}
+
+function stallThresholds () {
+  const slowest = receiveSession.roundTrips.length ? Math.max(...receiveSession.roundTrips) : 0
+  const scaled = (minimum, roundTrips) => Math.min(STALL_THRESHOLD_CAP_MS, Math.max(minimum, slowest * roundTrips))
+  return {
+    relinkAfterMs: scaled(STALL_RELINK_AFTER_MS, STALL_RELINK_ROUND_TRIPS),
+    senderCheckAfterRelinkMs: scaled(STALL_SENDER_CHECK_AFTER_RELINK_MS, STALL_SENDER_CHECK_ROUND_TRIPS),
+    senderCheckIntervalMs: scaled(STALL_SENDER_CHECK_INTERVAL_MS, STALL_SENDER_CHECK_ROUND_TRIPS)
+  }
+}
 
 function newStallState () {
   return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0, relinkedAt: 0 }
@@ -1394,7 +1444,9 @@ async function openShareLink (linkText) {
 
   // Run the client in the sender's mode. If this page already connected in another mode
   // (for example Balanced on load before a Maximum link was pasted), getNymNode switches it.
-  elementById('receive-mode').textContent = 'Network mode: ' + MODE_LABELS[link.mode] + ', set by the sender.'
+  const selectedMode = elementById('privacy-mode').value
+  elementById('receive-mode').textContent = 'Network mode: ' + MODE_LABELS[link.mode] + ', set by the sender.' + (selectedMode !== link.mode ? ' Your own setting, ' + MODE_LABELS[selectedMode] + ', applies only to files you send.' : '')
+  if (selectedMode !== link.mode) diagnostics.info('receive', 'using the sender\'s network mode instead of this page\'s setting', { senderMode: link.mode, pageSetting: selectedMode })
   try {
     receiveSession.node = await getNymNode(link.mode)
   } catch (error) {
@@ -1419,17 +1471,24 @@ async function openShareLink (linkText) {
 function startHelloRetries () {
   stopHelloRetries()
   receiveSession.hellosSent = 0
+  receiveSession.helloSentAt = new Map()
   receiveSession.helloStartedAt = performance.now()
   const sendHello = () => {
-    receiveSession.hellosSent += 1
-    receiveSession.helloSentAt = performance.now()
     // No return address: the sender answers through the reply blocks attached to this message.
-    receiveSession.node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId, attempt: receiveSession.hellosSent }, receiveSession.link.senderAddress).catch(() => {})
+    sendNumberedHello()
     const waitedMs = performance.now() - receiveSession.helloStartedAt
     receiveSession.helloTimer = setTimeout(sendHello, waitedMs < SENDER_REPLY_TIMEOUT_MS ? HELLO_RETRY_INTERVAL_MS : HELLO_RETRY_SLOW_INTERVAL_MS)
   }
   sendHello()
 }
+// Sends one hello with the next attempt number and remembers when, so the answer (which echoes the
+// number) gives a true round trip even when answers arrive out of order.
+function sendNumberedHello () {
+  receiveSession.hellosSent += 1
+  receiveSession.helloSentAt.set(receiveSession.hellosSent, performance.now())
+  receiveSession.node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId, attempt: receiveSession.hellosSent }, receiveSession.link.senderAddress).catch(() => {})
+}
+
 function stopHelloRetries () {
   clearTimeout(receiveSession.helloTimer)
   receiveSession.helloTimer = null
@@ -1440,7 +1499,9 @@ function handleReceiverControl (message) {
     diagnostics.warn('receive', 'control message for another share ignored', describeControlMessage(message))
     return
   }
-  const replyMs = receiveSession.helloSentAt ? Math.round(performance.now() - receiveSession.helloSentAt) : null
+  const helloSentAt = typeof message.attempt === 'number' ? receiveSession.helloSentAt.get(message.attempt) : undefined
+  const replyMs = helloSentAt === undefined ? null : Math.round(performance.now() - helloSentAt)
+  if (replyMs !== null && (message.kind === 'available' || message.kind === 'refused')) recordRoundTrip('hello ' + message.attempt, replyMs)
   if (message.kind === 'available' && receiveSession.downloading) {
     // An answer to a sender check made during a stall: the sender is up, so open a fresh link.
     if (receiveSession.stall.stage === 'checking-sender') {
@@ -1517,7 +1578,7 @@ async function startDownload () {
     requestsInFlight: torrent.wires.reduce((sum, wire) => sum + wire.requests.length, 0),
     peerChoking: torrent.wires.map(wire => wire.peerChoking),
     nymState: receiveSession.node.state,
-    stall: Object.assign({ quietMs: Date.now() - receiveSession.lastDataAt, linkGeneration: receiveSession.linkGeneration, lateFramesDropped: receiveSession.lateFramesDropped }, receiveSession.stall),
+    stall: Object.assign({ quietMs: Date.now() - receiveSession.lastDataAt, linkGeneration: receiveSession.linkGeneration, lateFramesDropped: receiveSession.lateFramesDropped, roundTripsMs: receiveSession.roundTrips }, receiveSession.stall, stallThresholds()),
     nym: receiveSession.node.counters,
     links: describeLinks([receiveSession.linkStream])
   }))
@@ -1575,6 +1636,7 @@ function routeReceiverFrame (frame) {
   const current = receiveSession.linkStream
   if (current && linkIdHex === bytesToHex(current.linkIdBytes)) {
     const deliveredBefore = current.nextExpectedSequence
+    if (current.stats.framesIn === 0) recordRoundTrip('link ' + receiveSession.linkGeneration + ' first frame', performance.now() - current.openedAt)
     current.receiveFrame(frame)
     if (current.nextExpectedSequence > deliveredBefore) noteReceiverData()
     return
@@ -1614,17 +1676,18 @@ function checkReceiverHealth () {
     linkGeneration: receiveSession.linkGeneration
   })
 
-  if (stall.stage === 'healthy' && quietMs >= STALL_RELINK_AFTER_MS) {
+  const thresholds = stallThresholds()
+  if (stall.stage === 'healthy' && quietMs >= thresholds.relinkAfterMs) {
     stall.stage = 'relinked'
     stall.stalledAt = receiveSession.lastDataAt
     stall.relinks += 1
-    diagnostics.warn('receive', 'no data for ' + Math.round(quietMs / 1000) + ' s; opening a new link', transferState())
+    diagnostics.warn('receive', 'no data for ' + Math.round(quietMs / 1000) + ' s; opening a new link', Object.assign(transferState(), thresholds))
     showReceiveNotice('warning', 'The transfer paused. Reconnecting to the sender.')
     openReceiverLink('stalled')
     return
   }
-  if (stall.stage !== 'healthy' && now - stall.relinkedAt >= STALL_SENDER_CHECK_AFTER_RELINK_MS && now - stall.lastSenderCheckAt >= STALL_SENDER_CHECK_INTERVAL_MS) {
-    checkSenderDuringStall('no data on the new link', transferState())
+  if (stall.stage !== 'healthy' && now - stall.relinkedAt >= thresholds.senderCheckAfterRelinkMs && now - stall.lastSenderCheckAt >= thresholds.senderCheckIntervalMs) {
+    checkSenderDuringStall('no data on the new link', Object.assign(transferState(), thresholds))
   }
 }
 
@@ -1639,8 +1702,7 @@ function checkSenderDuringStall (reason, details = {}) {
   stall.senderChecks += 1
   diagnostics.warn('receive', 'checking whether the sender is online', Object.assign({ reason, senderChecks: stall.senderChecks }, details))
   showReceiveNotice('warning', 'Waiting for the sender. Their tab may be closed, asleep or offline. This page keeps trying.')
-  receiveSession.helloSentAt = performance.now()
-  receiveSession.node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId }, receiveSession.link.senderAddress).catch(() => {})
+  sendNumberedHello()
 }
 
 async function finishDownload (torrent) {
@@ -1837,6 +1899,10 @@ if (FAULT_INJECTION_ENABLED) {
     dropIncomingData (seconds) {
       faultInjection.dropIncomingDataUntil = Date.now() + seconds * 1000
       diagnostics.warn('fault', 'dropping all incoming data frames', { seconds })
+    },
+    delayIncomingMessages (milliseconds) {
+      faultInjection.incomingDelayMs = Math.max(0, Number(milliseconds) || 0)
+      diagnostics.warn('fault', 'delaying every incoming message', { milliseconds: faultInjection.incomingDelayMs })
     },
     async closeGatewaySockets () {
       const node = await nymNodePromise

@@ -11,7 +11,9 @@
   patch reads the tag's 16 bytes out of WebAssembly memory, base58-encodes them, forwards the
   tag with each RawMessageReceived event, and exposes rawReply({ payload, senderTag }).
 
-  It also reports the worker's gateway WebSocket open, close and error events to the page (the
+  It also skips the worker's attempt to decode every message in the SDK's mime-typed format
+  (this page only sends raw frames, so every attempt failed with a console error), reports the
+  worker's gateway WebSocket open, close and error events to the page (the
   SDK has no disconnect event), exposes wymCloseGatewaySockets() for fault-injection tests, and
   returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
 
@@ -123,6 +125,14 @@ const WORKER_EDITS = [
   [
     'args: { payload: message },',
     'args: { payload: message, senderTag: senderTag },'
+  ],
+  // After posting the raw message, the worker tries to decode every message as the SDK's own
+  // mime-typed format. This page only sends raw frames, so each attempt fails, logs an error to the
+  // console and costs a WebAssembly call per frame. Returning here skips it; the page only
+  // subscribes to raw messages.
+  [
+    'args: { payload: message, senderTag: senderTag },\n                              });\n',
+    'args: { payload: message, senderTag: senderTag },\n                              });\n                              return [2 /*return*/];\n'
   ],
   [
     '          rawSend: function (args) {',

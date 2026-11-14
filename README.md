@@ -29,7 +29,7 @@ Open the page, drop in files and send the link. The recipient opens the link, or
 ## Reliability
 
 - If a Nym gateway connection drops and the Nym client does not restore it within 15 seconds, the page starts a new client with the same keys and the same gateway, so the address in a shared link keeps working. Only if that gateway refuses three reconnects does the page move to a new one, and then the sender sees a new link to send.
-- A recipient that receives no data for 20 seconds opens a new link to the sender. If that brings nothing within 15 seconds, or a link closes early, it checks whether the sender is online every 20 seconds and resumes when the sender answers. Pieces already received are kept.
+- A recipient that receives no data for 20 seconds opens a new link to the sender. If that brings nothing within 15 seconds, or a link closes early, it checks whether the sender is online every 20 seconds and resumes when the sender answers. Pieces already received are kept. On slow paths these waits grow with the measured round trip to the sender (three round trips before a new link, two before a check), up to three minutes, and WebTorrent's own handshake and request timeouts are raised from 25 and 30 seconds to two minutes (`build/webtorrent-latency-patch.mjs`).
 - Recipients repeat their first message to the sender until it answers, because messages through the mixnet can be delayed or lost.
 - While sending or receiving, the page asks the browser to keep the screen awake.
 
@@ -38,6 +38,7 @@ Open the page, drop in files and send the link. The recipient opens the link, or
 The Diagnostics panel logs every step, including how long each control message spent in transit. Opening the page with `?faults=1` adds test controls in the browser console:
 
 - `nymShareFaults.dropIncomingData(seconds)` discards all incoming data for that long.
+- `nymShareFaults.delayIncomingMessages(milliseconds)` holds every incoming message for that long, imitating a slow path. Pass 0 to stop.
 - `nymShareFaults.closeGatewaySockets()` closes this page's connection to its Nym gateway.
 - `nymShareFaults.replaceNymClient()` replaces the Nym client immediately.
 
