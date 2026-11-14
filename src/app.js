@@ -389,6 +389,7 @@ function renderIcons () {
 const NETWORK_STATUS_TEXT = {
   connecting: { text: 'Connecting', title: 'Joining the Nym mixnet.' },
   reconnecting: { text: 'Reconnecting', title: 'The connection to the Nym mixnet dropped. Reconnecting.' },
+  switching: { text: 'Reconnecting', title: 'This gateway was not delivering incoming messages. Moving to another one.' },
   connected: { text: 'Connected', title: 'Connected to the Nym mixnet.' },
   paused: { text: 'Paused', title: 'Disconnected after 5 minutes without activity, to save data. It reconnects when you use the page.' },
   failed: { text: 'Offline', title: 'Could not reach the Nym mixnet.' }
@@ -471,6 +472,20 @@ const NYM_DEFAULT_MESSAGE_STREAM_DELAY_MS = 20
 const NYM_DEFAULT_LOOP_COVER_DELAY_MS = 200
 const GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS = 10000
 const GATEWAY_TRAFFIC_IDLE_LOG_INTERVAL_MS = 60000
+// Incoming-path health. Every packet sent, real or cover, earns an acknowledgement back through
+// this client's gateway, so the share of acknowledgements that return shows whether messages can
+// reach this client at all. A gateway can keep the connection open and accept packets while
+// delivering almost nothing back (seen once in testing: the client received about a third of
+// the normal incoming traffic, and recipients' messages never arrived). The first check runs
+// HEALTH_FIRST_CHECK_MS after connecting; later checks reuse the 10 s traffic samples. Windows with
+// fewer than HEALTH_MIN_PACKETS_PER_WINDOW packets sent are too small to judge and are skipped.
+// HEALTH_ACK_RETURN_MINIMUM and the confirmation rule are set from the gateway test (README).
+const HEALTH_FIRST_CHECK_MS = 8000
+const HEALTH_MIN_PACKETS_PER_WINDOW = 200
+const HEALTH_ACK_RETURN_MINIMUM = 0.5
+// A connected client whose check fails this many windows in a row is reported as degraded. The
+// first check after connecting is decisive on its own: nothing depends on the address yet.
+const HEALTH_CONFIRMING_WINDOWS = 2
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
@@ -534,13 +549,119 @@ async function removeStaleNymStorage (currentClientId) {
   diagnostics.info('storage', 'earlier Nym client storage removed', { removed: staleNames.length, otherLiveClients })
 }
 
+// ---------------------------------------------------------------------------
+// Gateway choice
+// ---------------------------------------------------------------------------
+// Nym's API publishes every entry gateway with a performance score from Nym's own probes. Left to
+// itself, the Nym client picks uniformly at random among gateways scoring 50 % or more. In testing,
+// the one gateway that silently stopped delivering incoming messages scored 0.94, while every
+// gateway that worked scored 0.96 to 0.99, and 97 % of browser-usable gateways score at least
+// GATEWAY_MINIMUM_PERFORMANCE. So the page fetches the list once per page load (from the same Nym
+// API server the client contacts anyway), keeps gateways that browsers can reach over secure
+// WebSockets and that score at least the minimum, and picks one uniformly at random. Choosing at
+// random, rather than the fastest or a fixed list, keeps users of this page spread across the
+// whole network, where they are indistinguishable from other Nym users. Gateways this page has
+// already tried are skipped, so a switch never lands on the gateway it is leaving.
+// The client's own minimum-score setting is not used for this: it also removes gateways from the
+// client's view of the network, which would make anyone on a lower-scoring gateway unreachable.
+const GATEWAY_DIRECTORY_URL = NYM_API_URL + '/v1/unstable/nym-nodes/skimmed/entry-gateways/all'
+const GATEWAY_MINIMUM_PERFORMANCE = 0.95
+const GATEWAY_DIRECTORY_TIMEOUT_MS = 8000
+const GATEWAY_DIRECTORY_MAX_AGE_MS = 30 * 60 * 1000
+const gatewayDirectory = { promise: null, fetchedAt: 0, triedThisPage: new Set() }
+
+/** The gateway part of a Nym address (after the @), or null. */
+function gatewayOfAddress (address) {
+  return String(address ?? '').split('@')[1] || null
+}
+
+/** Resolves to [{ identity, performance }] for every gateway a browser can use, or [] on failure. */
+function loadGatewayDirectory () {
+  if (gatewayDirectory.promise && performance.now() - gatewayDirectory.fetchedAt < GATEWAY_DIRECTORY_MAX_AGE_MS) return gatewayDirectory.promise
+  const startedAt = performance.now()
+  gatewayDirectory.fetchedAt = startedAt
+  gatewayDirectory.promise = (async () => {
+    const abortController = new AbortController()
+    const timer = setTimeout(() => abortController.abort(), GATEWAY_DIRECTORY_TIMEOUT_MS)
+    try {
+      const response = await fetch(GATEWAY_DIRECTORY_URL, { signal: abortController.signal, credentials: 'omit', referrerPolicy: 'no-referrer' })
+      if (!response.ok) throw new Error('Nym API answered ' + response.status)
+      const body = await response.json()
+      const nodes = body?.nodes?.data ?? body?.data ?? body
+      if (!Array.isArray(nodes)) throw new Error('unexpected gateway list format')
+      // Pages are served over https, so only gateways with a secure WebSocket port are reachable.
+      const gateways = nodes
+        .filter(node => typeof node?.ed25519_identity_pubkey === 'string' && node.entry?.hostname && node.entry?.wss_port)
+        .map(node => ({ identity: node.ed25519_identity_pubkey, performance: Number(node.performance) }))
+        .filter(gateway => Number.isFinite(gateway.performance))
+      const eligible = gateways.filter(gateway => gateway.performance >= GATEWAY_MINIMUM_PERFORMANCE).length
+      diagnostics.info('nym', 'gateway list loaded', { ms: Math.round(performance.now() - startedAt), browserUsable: gateways.length, atOrAboveMinimum: eligible, minimumPerformance: GATEWAY_MINIMUM_PERFORMANCE })
+      return gateways
+    } catch (error) {
+      diagnostics.warn('nym', 'gateway list unavailable; the Nym client will choose a gateway itself', { ms: Math.round(performance.now() - startedAt), error })
+      gatewayDirectory.promise = null
+      return []
+    } finally {
+      clearTimeout(timer)
+    }
+  })()
+  return gatewayDirectory.promise
+}
+
+/** Uniform random integer in [0, upperBound) from the browser's cryptographic generator. */
+function randomIndex (upperBound) {
+  const limit = Math.floor(0x100000000 / upperBound) * upperBound
+  const value = new Uint32Array(1)
+  do {
+    crypto.getRandomValues(value)
+  } while (value[0] >= limit) // rejection sampling keeps every index equally likely
+  return value[0] % upperBound
+}
+
+/**
+ * Picks a gateway at random among those scoring at least minimumPerformance that this page has
+ * not tried yet, and marks it tried. Returns { identity, performance } or null, in which case the
+ * Nym client chooses by itself. The bounds let the gateway test sample particular score bands.
+ */
+async function chooseGateway ({ minimumPerformance = GATEWAY_MINIMUM_PERFORMANCE, maximumPerformance = Infinity } = {}) {
+  const gateways = await loadGatewayDirectory()
+  const candidates = gateways.filter(gateway => gateway.performance >= minimumPerformance && gateway.performance < maximumPerformance && !gatewayDirectory.triedThisPage.has(gateway.identity))
+  if (candidates.length === 0) return null
+  const chosen = candidates[randomIndex(candidates.length)]
+  gatewayDirectory.triedThisPage.add(chosen.identity)
+  return chosen
+}
+
+/** A gateway for the log: the first characters of its identity and its published score. */
+function describeGateway (gateway) {
+  if (!gateway?.identity) return null
+  return { gateway: gateway.identity.slice(0, 6) + '...', score: gateway.performance ?? 'not listed' }
+}
+
+/** One connect step as a short line for the log, for example "2210 ms gateway socket open (took 180 ms)". */
+function describeConnectStep (step) {
+  switch (step.event) {
+    case 'fetched': return step.atMs + ' ms ' + step.target + ' ' + step.status + ' (took ' + (step.atMs - step.startedAtMs) + ' ms)'
+    case 'fetch failed': return step.atMs + ' ms ' + step.target + ' failed (after ' + (step.atMs - step.startedAtMs) + ' ms)'
+    case 'gateway socket open': return step.atMs + ' ms gateway socket open (took ' + (step.atMs - step.openingAtMs) + ' ms)'
+    case 'gateway socket closed': return step.atMs + ' ms gateway socket closed, code ' + step.code + ' (lived ' + (step.atMs - step.openingAtMs) + ' ms)'
+    default: return step.atMs + ' ms ' + step.event
+  }
+}
+
+/** The published score of a gateway, or null when it is not in the list. */
+async function gatewayPerformance (identity) {
+  const gateways = await loadGatewayDirectory()
+  return gateways.find(gateway => gateway.identity === identity)?.performance ?? null
+}
+
 // A Nym node is one Nym identity (clientId) for the life of the page. The Nym client behind it
 // can be replaced: if the gateway connection is lost and the Nym client does not restore it
 // within NYM_INTERNAL_RECONNECT_GRACE_MS, the node starts a new client with the same clientId.
 // The keys and gateway registration stored under that id are reused, so the address in an
 // existing share link stays valid and messages the gateway held meanwhile are delivered.
 // Sends made while the client is being replaced wait for it (up to NYM_SEND_WAIT_MS).
-async function createNymNode (mode, abortSignal) {
+async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
   const startedAt = performance.now()
   const clientId = NYM_CLIENT_ID_PREFIX + crypto.randomUUID()
   const stopHeartbeat = startClientHeartbeat(clientId)
@@ -558,6 +679,10 @@ async function createNymNode (mode, abortSignal) {
     onControl: null,
     onData: null,
     onReconnected: null,
+    gateway: null, // { identity, performance } of the gateway in use, when known
+    health: { state: 'checking', acknowledgementReturn: null, failedWindows: 0, checks: 0 },
+    onHealthChange: null,
+    healthSwitches: 0,
     counters: { dataFramesIn: 0, dataBytesIn: 0, dataFramesOut: 0, dataBytesOut: 0, controlIn: 0, controlOut: 0, sendFailures: 0, unknownMessages: 0, gatewayDisconnects: 0, reconnects: 0, faultDroppedFrames: 0 }
   }
   // Only the page's current node drives the header status; a node being replaced stays quiet.
@@ -578,7 +703,7 @@ async function createNymNode (mode, abortSignal) {
   // per-phase totals are kept so every entry also carries the averages so far.
   const streamDelayMs = NYM_CLIENT_OVERRIDES[mode]?.traffic?.messageSendingAverageDelayMs ?? NYM_DEFAULT_MESSAGE_STREAM_DELAY_MS
   const expectedPacketsOutPerSecond = 1000 / streamDelayMs + 1000 / NYM_DEFAULT_LOOP_COVER_DELAY_MS
-  const createTrafficTotals = () => ({ milliseconds: 0, packetsOut: 0, bytesOut: 0, packetsIn: 0, bytesIn: 0, textMessagesOut: 0, textMessagesIn: 0, hiddenSamples: 0, samples: 0 })
+  const createTrafficTotals = () => ({ milliseconds: 0, packetsOut: 0, bytesOut: 0, packetsIn: 0, bytesIn: 0, acknowledgementsIn: 0, textMessagesOut: 0, textMessagesIn: 0, hiddenSamples: 0, samples: 0 })
   const gatewayTrafficTotals = { idle: createTrafficTotals(), busy: createTrafficTotals() }
   let gatewayTrafficBaseline = null
   let gatewayTrafficWindow = null
@@ -598,6 +723,7 @@ async function createNymNode (mode, abortSignal) {
       averagePacketBytesOut: totals.packetsOut > 0 ? Math.round(totals.bytesOut / totals.packetsOut) : null,
       packetsInPerSecond: Math.round(totals.packetsIn / seconds * 10) / 10,
       megabitsInPerSecond: Math.round(totals.bytesIn * 8 / seconds / 1e4) / 100,
+      acknowledgementsPerPacketOut: totals.packetsOut > 0 ? Math.round(totals.acknowledgementsIn / totals.packetsOut * 100) / 100 : null,
       percentOfExpectedOut: Math.round(totals.packetsOut / seconds / expectedPacketsOutPerSecond * 100),
       tabHiddenSamples: totals.hiddenSamples,
       samples: totals.samples
@@ -658,11 +784,13 @@ async function createNymNode (mode, abortSignal) {
         bytesOut: reading.binaryBytesOut - baseline.reading.binaryBytesOut,
         packetsIn: reading.binaryMessagesIn - baseline.reading.binaryMessagesIn,
         bytesIn: reading.binaryBytesIn - baseline.reading.binaryBytesIn,
+        acknowledgementsIn: reading.acknowledgementsIn - baseline.reading.acknowledgementsIn,
         textMessagesOut: reading.textMessagesOut - baseline.reading.textMessagesOut,
         textMessagesIn: reading.textMessagesIn - baseline.reading.textMessagesIn,
         hiddenSamples: document.visibilityState === 'hidden' ? 1 : 0,
         samples: 1
       }
+      evaluateHealth(sample)
       if (gatewayTrafficWindow && gatewayTrafficWindow.phase !== phase) flushGatewayTrafficWindow()
       if (!gatewayTrafficWindow) gatewayTrafficWindow = { phase, totals: createTrafficTotals() }
       addTrafficTotals(gatewayTrafficWindow.totals, sample)
@@ -675,6 +803,58 @@ async function createNymNode (mode, abortSignal) {
     }
   }
   const gatewayTrafficTimer = setInterval(sampleGatewayTraffic, GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS)
+
+  // ---- Incoming-path health -------------------------------------------------------------------
+  let healthWaiters = []
+  let firstHealthCheckTimer = null
+  const setHealth = (state, details) => {
+    const previous = node.health.state
+    Object.assign(node.health, { state }, details)
+    if (state !== 'checking') {
+      const waiters = healthWaiters
+      healthWaiters = []
+      for (const waiter of waiters) waiter()
+    }
+    if (state !== previous) {
+      diagnostics.log(state === 'degraded' ? 'warn' : 'info', 'nym', 'incoming path ' + state, { acknowledgementsPerPacketOut: node.health.acknowledgementReturn, checks: node.health.checks, gateway: describeGateway(node.gateway) })
+      try { node.onHealthChange?.(node.health) } catch (error) { diagnostics.error('nym', 'health handler failed', error) }
+    }
+  }
+  const evaluateHealth = sample => {
+    if (node.health.state === 'degraded' || sample.packetsOut < HEALTH_MIN_PACKETS_PER_WINDOW) return
+    const acknowledgementReturn = Math.round(sample.acknowledgementsIn / sample.packetsOut * 100) / 100
+    const passed = acknowledgementReturn >= HEALTH_ACK_RETURN_MINIMUM
+    const checks = node.health.checks + 1
+    const failedWindows = passed ? 0 : node.health.failedWindows + 1
+    const firstCheck = node.health.state === 'checking'
+    if (passed) setHealth('healthy', { acknowledgementReturn, failedWindows, checks })
+    else if (firstCheck || failedWindows >= HEALTH_CONFIRMING_WINDOWS) setHealth('degraded', { acknowledgementReturn, failedWindows, checks })
+    else {
+      Object.assign(node.health, { acknowledgementReturn, failedWindows, checks })
+      diagnostics.warn('nym', 'few acknowledgements came back; checking again', { acknowledgementsPerPacketOut: acknowledgementReturn, failedWindows })
+    }
+  }
+  // Starts a fresh check for the client now in use: a baseline reading right away, and a first
+  // verdict HEALTH_FIRST_CHECK_MS later instead of waiting for the next 10 s sample.
+  const beginHealthCheck = () => {
+    setHealth('checking', { acknowledgementReturn: null, failedWindows: 0, checks: 0 })
+    clearTimeout(firstHealthCheckTimer)
+    gatewayTrafficBaseline = null
+    sampleGatewayTraffic()
+    firstHealthCheckTimer = setTimeout(sampleGatewayTraffic, HEALTH_FIRST_CHECK_MS)
+  }
+  /** Resolves once the first check has a verdict, or after timeoutMs, whichever is first. */
+  node.waitForHealthVerdict = timeoutMs => {
+    if (node.health.state !== 'checking') return Promise.resolve(node.health.state)
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        healthWaiters = healthWaiters.filter(entry => entry !== waiter)
+        resolve('checking')
+      }, timeoutMs)
+      const waiter = () => { clearTimeout(timer); resolve(node.health.state) }
+      healthWaiters.push(waiter)
+    })
+  }
 
   const setState = state => {
     node.state = state
@@ -699,6 +879,17 @@ async function createNymNode (mode, abortSignal) {
     })
   }
 
+  const pendingProbes = new Map()
+  // Logs when each network step of the latest connect happened, relative to the moment its Nym
+  // client was created: Nym API fetches, gateway sockets opening, open and closed, and connected.
+  const logConnectSteps = purpose => {
+    const connectedAfterMs = Math.round(performance.now() - lastClientStartedAt)
+    mixnetClient?.client.wymConnectTimeline().then(timeline => {
+      node.lastConnectSteps = { purpose, connectedAfterMs, timeline }
+      diagnostics.info('nym', 'connect steps', { purpose, connectedAfterMs, steps: timeline.map(describeConnectStep) })
+    }).catch(error => diagnostics.warn('nym', 'connect steps unavailable', error))
+  }
+  node.waitUntilUsable = waitUntilUsable
   // senderTag is set when the message carried reply blocks (see build/nym-reply-patch.mjs),
   // and null for replies, which carry none.
   const handleRawMessage = event => {
@@ -732,6 +923,11 @@ async function createNymNode (mode, abortSignal) {
       return
     }
     node.counters.controlIn += 1
+    // A message this client sent to itself (gateway test): settle it and stop here.
+    if (message?.kind === 'probe' && typeof message.nonce === 'string' && pendingProbes.has(message.nonce)) {
+      pendingProbes.get(message.nonce)()
+      return
+    }
     const transitMs = typeof message?.sentAt === 'number' ? Date.now() - message.sentAt : null
     diagnostics.log(transitMs !== null && transitMs > SLOW_CONTROL_MESSAGE_MS ? 'warn' : 'info', 'control', 'received ' + message?.kind, Object.assign(describeControlMessage(message), { transitMs, replyTag: describeReplyTag(senderTag) }))
     try {
@@ -779,11 +975,13 @@ async function createNymNode (mode, abortSignal) {
 
   // Starts a Nym client under this node's clientId and waits for its gateway connection.
   // Events from a client that has since been replaced are ignored.
+  let lastClientStartedAt = 0
   const startClient = async (purpose, preferredGateway) => {
     if (abortSignal?.aborted) throw createAbortError()
     const generation = ++clientGeneration
     const attemptStartedAt = performance.now()
     const { createNymMixnetClient } = await loadLibraries()
+    lastClientStartedAt = performance.now()
     const candidate = await createNymMixnetClient()
     let connectedAddress = null
     candidate.events.subscribeToConnected(event => { if (generation === clientGeneration) connectedAddress = event.args.address })
@@ -798,7 +996,7 @@ async function createNymNode (mode, abortSignal) {
       await shutDownClient(candidate, purpose)
       throw error
     }
-    diagnostics.info('nym', 'client started, waiting for gateway', { purpose, sameGatewayRequested: Boolean(preferredGateway), ms: Math.round(performance.now() - attemptStartedAt) })
+    diagnostics.info('nym', 'client started, waiting for gateway', { purpose, gatewayRequested: Boolean(preferredGateway), ms: Math.round(performance.now() - attemptStartedAt) })
     const attemptStartedWall = Date.now()
     const hardDeadline = attemptStartedWall + NYM_CONNECT_ATTEMPT_MAX_MS
     const currentDeadline = () => Math.min(hardDeadline, Math.max(attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS, lastSocketActivityAt + NYM_CONNECT_ACTIVITY_GRACE_MS))
@@ -830,8 +1028,12 @@ async function createNymNode (mode, abortSignal) {
   }
 
   try {
-    const { address } = await startClient('initial')
+    const chosen = await chooseGateway(gatewayBand ?? {})
+    if (chosen) diagnostics.info('nym', 'gateway chosen', describeGateway(chosen))
+    const { address } = await startClient('initial', chosen?.identity ?? null)
     node.address = address
+    node.gateway = chosen && gatewayOfAddress(address) === chosen.identity ? chosen : { identity: gatewayOfAddress(address), performance: await gatewayPerformance(gatewayOfAddress(address)) }
+    if (node.gateway.identity) gatewayDirectory.triedThisPage.add(node.gateway.identity)
   } catch (error) {
     // A first attempt that never connected leaves nothing worth keeping.
     clearInterval(gatewayTrafficTimer)
@@ -840,35 +1042,51 @@ async function createNymNode (mode, abortSignal) {
     throw error
   }
   setState('connected')
-  diagnostics.info('nym', 'connected', { address: redactNymAddress(node.address), ms: Math.round(performance.now() - startedAt) })
+  node.connectMs = Math.round(performance.now() - startedAt)
+  diagnostics.info('nym', 'connected', { address: redactNymAddress(node.address), ms: node.connectMs, gateway: describeGateway(node.gateway) })
+  logConnectSteps('initial')
+  beginHealthCheck()
 
-  // Replaces the Nym client, keeping this node's identity. Concurrent calls share one attempt.
-  node.reconnect = reason => {
+  // Replaces the Nym client, keeping this node's identity (its keys), so a reconnect to the same
+  // gateway keeps the address. Concurrent calls share one attempt. With newGateway, the first
+  // attempt already moves to another gateway, which changes the address; otherwise the current
+  // gateway is tried NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS times first. Each new gateway is chosen
+  // as at startup (scored, random, never one this page already tried).
+  node.reconnect = (reason, { newGateway = false, status = 'reconnecting' } = {}) => {
     if (node.state === 'stopped') return Promise.resolve(false)
     if (reconnectPromise) return reconnectPromise
     reconnectPromise = (async () => {
       const reconnectStartedAt = performance.now()
       setState('reconnecting')
-      reportNetworkStatus('reconnecting')
-      diagnostics.warn('nym', 'replacing the Nym client with the same identity', { reason })
+      clearTimeout(firstHealthCheckTimer)
+      reportNetworkStatus(status)
+      diagnostics.warn('nym', newGateway ? 'moving this identity to another gateway' : 'replacing the Nym client with the same identity', { reason })
       const previousClient = mixnetClient
       mixnetClient = null
       if (previousClient) await shutDownClient(previousClient, 'replaced')
-      // The gateway is the part of the address after "@".
-      const currentGateway = String(node.address).split('@')[1] || null
+      const currentGateway = gatewayOfAddress(node.address)
+      const sameGatewayAttempts = newGateway ? 0 : NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS
       for (let attempt = 1; node.state === 'reconnecting'; attempt += 1) {
-        const keepGateway = Boolean(currentGateway) && attempt <= NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS
-        if (attempt === NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS + 1) diagnostics.warn('nym', 'the current gateway did not accept ' + NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS + ' reconnects; trying a new gateway, which changes the address')
+        const keepGateway = Boolean(currentGateway) && attempt <= sameGatewayAttempts
+        if (!newGateway && attempt === sameGatewayAttempts + 1) diagnostics.warn('nym', 'the current gateway did not accept ' + sameGatewayAttempts + ' reconnects; trying a new gateway, which changes the address')
         try {
-          const { address, ms } = await startClient('reconnect', keepGateway ? currentGateway : null)
+          const chosen = keepGateway ? null : await chooseGateway()
+          if (chosen) diagnostics.info('nym', 'gateway chosen', describeGateway(chosen))
+          const { address, ms } = await startClient(newGateway ? 'switch' : 'reconnect', keepGateway ? currentGateway : chosen?.identity ?? null)
           node.counters.reconnects += 1
           const sameAddress = address === node.address
-          diagnostics.info('nym', 'reconnected', { attempt, ms, totalMs: Math.round(performance.now() - reconnectStartedAt), sameAddress })
+          node.lastReconnectMs = Math.round(performance.now() - reconnectStartedAt)
+          diagnostics.info('nym', newGateway ? 'moved to another gateway' : 'reconnected', { attempt, ms, totalMs: node.lastReconnectMs, sameAddress })
           if (!sameAddress) {
             diagnostics.warn('nym', 'the Nym address changed while reconnecting', { previous: redactNymAddress(node.address), current: redactNymAddress(address) })
             node.address = address
+            const identity = gatewayOfAddress(address)
+            node.gateway = chosen?.identity === identity ? chosen : { identity, performance: await gatewayPerformance(identity) }
+            gatewayDirectory.triedThisPage.add(identity)
           }
           setState('connected')
+          logConnectSteps(newGateway ? 'switch' : 'reconnect')
+          beginHealthCheck()
           reportNetworkStatus('connected')
           try { node.onReconnected?.({ sameAddress }) } catch (error) { diagnostics.error('nym', 'reconnect handler failed', error) }
           return true
@@ -926,8 +1144,19 @@ async function createNymNode (mode, abortSignal) {
   }
   // Test hook, reachable only through the ?faults=1 controls.
   node.closeGatewaySocketsForTest = async () => (mixnetClient ? mixnetClient.client.wymCloseGatewaySockets() : 0)
+  // Gateway test hooks: raw counters, and a message sent to this client's own address, which
+  // crosses the mixnet out and back like any other message. Resolves to its round trip in ms.
+  node.readGatewayTraffic = () => (mixnetClient ? mixnetClient.client.wymGatewayTraffic() : null)
+  node.probeSelf = timeoutMs => new Promise((resolve, reject) => {
+    const nonce = bytesToHex(crypto.getRandomValues(new Uint8Array(8)))
+    const sentAt = performance.now()
+    const timer = setTimeout(() => { pendingProbes.delete(nonce); reject(new Error('no answer within ' + timeoutMs + ' ms')) }, timeoutMs)
+    pendingProbes.set(nonce, () => { clearTimeout(timer); pendingProbes.delete(nonce); resolve(Math.round(performance.now() - sentAt)) })
+    node.send(encodeControlMessage({ kind: 'probe', nonce }), node.address).catch(error => { clearTimeout(timer); pendingProbes.delete(nonce); reject(error) })
+  })
   node.stop = async () => {
     clearInterval(gatewayTrafficTimer)
+    clearTimeout(firstHealthCheckTimer)
     flushGatewayTrafficWindow()
     diagnostics.info('nym', 'stopping client', Object.assign({}, node.counters, { gatewayTraffic: node.describeGatewayTraffic() }))
     setState('stopped')
@@ -1511,7 +1740,33 @@ function renderFileRows (listElement, files, options = {}) {
 function attachNodeDispatch (node) {
   node.onControl = (message, senderTag) => dispatchControlMessage(node, message, senderTag)
   node.onData = (frame, senderTag) => dispatchDataFrame(frame, senderTag)
-  node.onReconnected = ({ sameAddress }) => { if (sendSession.node === node) handleSenderReconnected(sameAddress) }
+  node.onReconnected = ({ sameAddress }) => {
+    if (sendSession.node === node) handleSenderReconnected(sameAddress)
+    if (receiveSession.node === node) handleReceiverReconnected(sameAddress)
+  }
+  node.onHealthChange = health => handleNodeHealth(node, health)
+}
+
+// What the page does when its gateway stops delivering incoming messages (see the health check in
+// createNymNode). With no link out, moving to another gateway costs nothing visible, so it moves
+// at once. A sender whose link is already out first reconnects to the same gateway, which keeps the
+// address and the link; only if that does not help does it move, and then shows the new link.
+// A recipient's address is in no link, so it moves at once and reopens its link to the sender.
+// A node switches at most HEALTH_SWITCH_LIMIT times, so a wider outage cannot cause endless moves.
+const HEALTH_SWITCH_LIMIT = 3
+function handleNodeHealth (node, health) {
+  if (health.state !== 'degraded' || node.state !== 'connected') return
+  if (node.healthSwitches >= HEALTH_SWITCH_LIMIT) {
+    diagnostics.warn('nym', 'incoming messages are still not arriving after ' + HEALTH_SWITCH_LIMIT + ' gateway changes; staying put', { acknowledgementsPerPacketOut: health.acknowledgementReturn })
+    return
+  }
+  node.healthSwitches += 1
+  const linkShared = sendSession.node === node && Boolean(sendSession.linkFields)
+  const keepAddress = linkShared && !node.healthSameGatewayTried
+  if (keepAddress) node.healthSameGatewayTried = true
+  const reason = 'only ' + Math.round(health.acknowledgementReturn * 100) + '% of acknowledgements came back'
+  diagnostics.warn('nym', keepAddress ? 'incoming messages are not arriving; reconnecting to the same gateway to keep the shared link' : 'incoming messages are not arriving; moving to another gateway', { reason, switches: node.healthSwitches })
+  node.reconnect(reason, { newGateway: !keepAddress, status: keepAddress ? 'reconnecting' : 'switching' })
 }
 
 function dispatchControlMessage (node, message, senderTag) {
@@ -1608,6 +1863,7 @@ async function startSharing (fileList) {
     }
     sendSession.node = await nodePromise
     sendSession.mode = mode
+    await confirmIncomingPathBeforeLink(sendSession.node)
 
     sendSession.client = new WebTorrent({ tracker: false, dht: false, lsd: false, webSeeds: false })
     sendSession.client.on('error', error => showShareError(error))
@@ -1889,6 +2145,40 @@ function startSenderStats () {
     updateShareDataNotice()
     updateDocumentTitle()
   }, 1000)
+}
+
+// The link carries this page's address, so before making it the page waits for the first check
+// that messages can reach it (about 8 s after connecting; usually already done while files were
+// being chosen). If the check fails, the node moves to another gateway and is checked again.
+// Past HEALTH_WAIT_BEFORE_LINK_MS in total the link is made anyway; the checks keep running.
+const HEALTH_WAIT_BEFORE_LINK_MS = 30000
+async function confirmIncomingPathBeforeLink (node) {
+  if (node.health.state === 'healthy' && node.state === 'connected') return
+  const startedAt = performance.now()
+  const deadline = startedAt + HEALTH_WAIT_BEFORE_LINK_MS
+  renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Checking the connection', caption: 'Making sure messages can reach you before the link is made. This takes a few seconds.', progress: 'indeterminate', startedAt })
+  while (performance.now() < deadline) {
+    if (node.state !== 'connected') {
+      renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Moving to another gateway', caption: 'The first gateway was not delivering messages. This usually takes 5 to 10 seconds.', progress: 'indeterminate', startedAt })
+      try {
+        await node.waitUntilUsable()
+      } catch (error) {
+        break
+      }
+      renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Checking the connection', caption: 'Making sure messages can reach you before the link is made. This takes a few seconds.', progress: 'indeterminate', startedAt })
+    }
+    const verdict = await node.waitForHealthVerdict(Math.max(0, deadline - performance.now()))
+    if (verdict === 'healthy' && node.state === 'connected') {
+      diagnostics.info('send', 'incoming path confirmed before making the link', { waitedMs: Math.round(performance.now() - startedAt) })
+      return
+    }
+    if (verdict === 'checking') break
+    // A failed check starts a move (handleNodeHealth). If none began, the switch limit was
+    // reached and waiting longer cannot help.
+    await new Promise(resolve => setTimeout(resolve, 250))
+    if (node.state === 'connected' && node.health.state === 'degraded') break
+  }
+  diagnostics.warn('send', 'making the link before the incoming path was confirmed', { waitedMs: Math.round(performance.now() - startedAt), health: node.health.state })
 }
 
 function setShareHeading (title, subtitle) {
@@ -2458,6 +2748,20 @@ function noteReceiverData () {
   setReceiveStage(receiveSession.torrent?.downloaded > 0 ? 'receiving' : 'setting-up')
 }
 
+// This page moved to another gateway (its own gateway stopped delivering). The sender answers
+// through reply blocks that lead to the old gateway, so a new link, which carries fresh ones, is
+// opened at once instead of waiting for the stall timer.
+function handleReceiverReconnected (sameAddress) {
+  if (sameAddress || !receiveSession.downloading || !receiveSession.stall) return
+  const stall = receiveSession.stall
+  diagnostics.info('receive', 'this page moved to another gateway; opening a new link to the sender', { linkGeneration: receiveSession.linkGeneration })
+  if (stall.stage === 'healthy') stall.stalledAt = receiveSession.lastDataAt
+  stall.stage = 'relinked'
+  stall.relinks += 1
+  setReceiveStage('reconnecting')
+  openReceiverLink('this page moved to another gateway')
+}
+
 // Runs every STALL_CHECK_INTERVAL_MS while downloading. While this page's own Nym client is
 // reconnecting, the node handles recovery and the stall clock is not acted on.
 function checkReceiverHealth () {
@@ -2684,6 +2988,149 @@ function leaveReceiveView () {
 }
 
 // ---------------------------------------------------------------------------
+// Gateway test (?gatewaytest=N)
+// ---------------------------------------------------------------------------
+// A measurement tool, not part of normal use. Opened with ?gatewaytest=N, the page connects N
+// times in a row, each time with a fresh identity on a random gateway, cycling through three
+// score bands so they can be compared. For each run it records the gateway's published score,
+// how long connecting took and when each network step happened, the share of acknowledgements
+// that came back over the first check and over a further 20 s, the round trip of messages sent
+// to its own address, and how long reconnecting to the same gateway and moving to a new one took.
+// Every client is stopped before the next starts. Results go to the Diagnostics log and to
+// window.nymShareGatewayTest; a table on the page shows progress.
+const GATEWAY_TEST_BANDS = [
+  { label: 'below 0.95', minimumPerformance: 0.5, maximumPerformance: 0.95 },
+  { label: '0.95 to 0.98', minimumPerformance: 0.95, maximumPerformance: 0.99 },
+  { label: '0.99 and up', minimumPerformance: 0.99, maximumPerformance: Infinity }
+]
+const GATEWAY_TEST_STEADY_MS = 20000
+const GATEWAY_TEST_PROBES = 3
+const GATEWAY_TEST_PROBE_TIMEOUT_MS = 20000
+const GATEWAY_TEST_MAX_RUNS = 60
+
+function median (values) {
+  const numbers = values.filter(value => typeof value === 'number' && Number.isFinite(value)).sort((left, right) => left - right)
+  if (numbers.length === 0) return null
+  const middle = Math.floor(numbers.length / 2)
+  return numbers.length % 2 ? numbers[middle] : Math.round((numbers[middle - 1] + numbers[middle]) / 2 * 100) / 100
+}
+
+/** Summarises the connect timeline: when the Nym API work ended and the gateway socket opened. */
+function summariseConnectSteps (steps) {
+  const timeline = steps?.timeline ?? []
+  const nymApi = timeline.filter(step => step.event === 'fetched' && step.target.startsWith('nym api'))
+  const opened = timeline.filter(step => step.event === 'gateway socket open')
+  const closed = timeline.filter(step => step.event === 'gateway socket closed')
+  return {
+    nymApiFetches: nymApi.length,
+    nymApiDoneMs: nymApi.length ? Math.max(...nymApi.map(step => step.atMs)) : null,
+    firstGatewaySocketOpenMs: opened.length ? opened[0].atMs : null,
+    gatewaySocketsOpened: opened.length,
+    gatewaySocketsClosedBeforeConnected: closed.filter(step => step.atMs <= (steps?.connectedAfterMs ?? Infinity)).length,
+    connectedMs: steps?.connectedAfterMs ?? null
+  }
+}
+
+async function runGatewayTest (runs) {
+  const mode = currentMode()
+  const results = []
+  const state = { mode, runs, results, summary: null, running: true }
+  window.nymShareGatewayTest = state
+  const progress = createElement('p', { className: 'muted small' })
+  const table = createElement('div', { className: 'log-output', role: 'log' })
+  const card = createElement('section', { className: 'card' }, [createElement('h2', { text: 'Gateway test' }), progress, table])
+  document.querySelector('main').prepend(card)
+  const render = () => {
+    progress.textContent = (state.running ? 'Run ' + Math.min(results.length + 1, runs) + ' of ' + runs : 'Finished ' + runs + ' runs') + ' in ' + MODE_LABELS[mode] + '. Each run takes about a minute; keep this tab in front.'
+    table.textContent = results.map(result => [
+      String(result.run).padStart(2), result.band.padEnd(12), String(result.gateway?.score ?? '-').padEnd(5),
+      'connect ' + (result.connectMs ?? '-') + ' ms', 'acks ' + (result.firstCheckAcknowledgements ?? '-') + '/' + (result.steadyAcknowledgements ?? '-'),
+      'probe ' + (result.probeMs?.map(value => value ?? 'lost').join(',') ?? '-'), 'reconnect ' + (result.reconnectMs ?? '-') + ' ms', 'move ' + (result.moveMs ?? '-') + ' ms',
+      result.error ? 'ERROR ' + result.error : ''
+    ].join('  ')).join('\n') + (state.summary ? '\n\n' + JSON.stringify(state.summary, null, 1) : '')
+  }
+  render()
+  diagnostics.info('gwtest', 'gateway test started', { runs, mode, bands: GATEWAY_TEST_BANDS.map(band => band.label) })
+
+  for (let run = 1; run <= runs; run += 1) {
+    const band = GATEWAY_TEST_BANDS[(run - 1) % GATEWAY_TEST_BANDS.length]
+    const result = { run, band: band.label }
+    let node = null
+    try {
+      node = await createNymNode(mode, null, { gatewayBand: band })
+      result.gateway = describeGateway(node.gateway)
+      result.connectMs = node.connectMs
+      const verdict = await node.waitForHealthVerdict(HEALTH_FIRST_CHECK_MS + 6000)
+      result.firstCheck = verdict
+      result.firstCheckAcknowledgements = node.health.acknowledgementReturn
+      result.connectSteps = summariseConnectSteps(node.lastConnectSteps)
+
+      const before = await node.readGatewayTraffic()
+      const steadyStartedAt = performance.now()
+      result.probeMs = []
+      for (let probe = 0; probe < GATEWAY_TEST_PROBES; probe += 1) {
+        try {
+          result.probeMs.push(await node.probeSelf(GATEWAY_TEST_PROBE_TIMEOUT_MS))
+        } catch (error) {
+          result.probeMs.push(null)
+        }
+      }
+      const remainingMs = GATEWAY_TEST_STEADY_MS - (performance.now() - steadyStartedAt)
+      if (remainingMs > 0) await new Promise(resolve => setTimeout(resolve, remainingMs))
+      const after = await node.readGatewayTraffic()
+      const packetsOut = after.binaryMessagesOut - before.binaryMessagesOut
+      const acknowledgements = after.acknowledgementsIn - before.acknowledgementsIn
+      const fullPackets = (after.binaryMessagesIn - after.acknowledgementsIn) - (before.binaryMessagesIn - before.acknowledgementsIn)
+      result.steadySeconds = Math.round((after.sampledAtMs - before.sampledAtMs) / 1000)
+      result.steadyPacketsOut = packetsOut
+      result.steadyAcknowledgements = packetsOut ? Math.round(acknowledgements / packetsOut * 100) / 100 : null
+      result.steadyFullPacketsBack = packetsOut ? Math.round(fullPackets / packetsOut * 100) / 100 : null
+
+      // The two kinds of switch: reconnecting to the same gateway (keeps the address) and moving
+      // this identity to a new gateway (what a failed health check does).
+      const addressBefore = node.address
+      if (await node.reconnect('gateway test: reconnect to the same gateway')) {
+        result.reconnectMs = node.lastReconnectMs
+        result.reconnectKeptAddress = node.address === addressBefore
+      }
+      if (await node.reconnect('gateway test: move to a new gateway', { newGateway: true })) {
+        result.moveMs = node.lastReconnectMs
+        result.movedTo = describeGateway(node.gateway)
+      }
+    } catch (error) {
+      result.error = error?.message ?? String(error)
+    } finally {
+      if (node) await node.stop()
+    }
+    results.push(result)
+    diagnostics.info('gwtest', 'run ' + run + ' of ' + runs, result)
+    render()
+  }
+
+  state.summary = Object.fromEntries(GATEWAY_TEST_BANDS.map(band => {
+    const inBand = results.filter(result => result.band === band.label)
+    const completed = inBand.filter(result => !result.error)
+    const probes = completed.flatMap(result => result.probeMs ?? [])
+    return [band.label, {
+      runs: inBand.length,
+      failedToConnect: inBand.filter(result => result.connectMs === undefined).length,
+      firstCheckFailed: completed.filter(result => result.firstCheck === 'degraded').length,
+      medianConnectMs: median(completed.map(result => result.connectMs)),
+      medianFirstCheckAcknowledgements: median(completed.map(result => result.firstCheckAcknowledgements)),
+      medianSteadyAcknowledgements: median(completed.map(result => result.steadyAcknowledgements)),
+      lowestSteadyAcknowledgements: completed.length ? Math.min(...completed.map(result => result.steadyAcknowledgements ?? 1)) : null,
+      medianProbeMs: median(probes),
+      probesLost: probes.filter(value => value === null).length + ' of ' + probes.length,
+      medianReconnectMs: median(completed.map(result => result.reconnectMs)),
+      medianMoveMs: median(completed.map(result => result.moveMs))
+    }]
+  }))
+  state.running = false
+  diagnostics.info('gwtest', 'gateway test finished', state.summary)
+  render()
+}
+
+// ---------------------------------------------------------------------------
 // Idle disconnect
 // ---------------------------------------------------------------------------
 // A connected tab uses about 0.8 to 2 GB of data an hour even with nothing to send. With nothing
@@ -2698,6 +3145,7 @@ function nothingInProgress () {
   return false
 }
 function noteUserActivity () {
+  if (window.nymShareGatewayTest) return // the gateway test manages its own connections
   clearTimeout(idleTimer)
   idleTimer = setTimeout(disconnectIfIdle, NYM_IDLE_DISCONNECT_MS)
   if (!nymNodePromise && currentView() === 'view-choose') ensureNymConnected('activity on the start page')
@@ -2889,12 +3337,18 @@ fitSelectToSelection(elementById('network-mode'))
 wireUserInterface()
 updateModeControl()
 renderIcons()
-if (location.hash.length > 1) {
+const gatewayTestRuns = Number.parseInt(new URLSearchParams(location.search).get('gatewaytest') ?? '', 10)
+if (Number.isInteger(gatewayTestRuns) && gatewayTestRuns > 0) {
+  // Measurement only: no normal connection, no idle disconnect.
+  elementById('diagnostics').open = true
+  runGatewayTest(Math.min(gatewayTestRuns, GATEWAY_TEST_MAX_RUNS)).catch(error => diagnostics.error('gwtest', 'gateway test failed', error))
+} else if (location.hash.length > 1) {
   diagnostics.info('diag', 'link found in address bar; opening receive view')
   openShareLink(location.href, { fromAddressBar: true })
+  noteUserActivity()
 } else {
   history.replaceState({ view: 'choose' }, '', location.href)
   // Connect while the sender is still choosing files.
   ensureNymConnected('page opened')
+  noteUserActivity()
 }
-noteUserActivity()

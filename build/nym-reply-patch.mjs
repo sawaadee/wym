@@ -15,7 +15,9 @@
   (this page only sends raw frames, so every attempt failed with a console error), reports the
   worker's gateway WebSocket open, close and error events to the page (the
   SDK has no disconnect event), counts the messages and bytes the worker exchanges with its
-  gateway (wymGatewayTraffic()), exposes wymCloseGatewaySockets() for fault-injection tests, and
+  gateway, telling acknowledgements apart from full packets (wymGatewayTraffic()), records when
+  each network step of a connect happens (wymConnectTimeline()), exposes wymCloseGatewaySockets()
+  for fault-injection tests, and
   returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
 
   The worker source is decoded and re-encoded as Latin-1 so every byte outside the patched
@@ -81,9 +83,44 @@ const GATEWAY_SOCKET_TRACKING = `
   // client sends each Sphinx packet as one binary WebSocket message and every request or
   // response as a text message, so binary messages out count mix packets (real and cover).
   // Ping frames are handled by the browser and never reach these counters.
+  // Every packet the client sends, real or cover, carries an acknowledgement that the gateway
+  // pushes back once the packet arrives; measured on the live network, acknowledgements arrive as
+  // 51-byte binary messages and full packets (returning cover, or real data) as 1673 bytes. Any
+  // binary message of WYM_ACK_MAX_BYTES or less is counted as an acknowledgement.
+  const WYM_ACK_MAX_BYTES = 256;
   const wymGatewayTraffic = {
       binaryMessagesOut: 0, binaryBytesOut: 0, textMessagesOut: 0, textBytesOut: 0,
-      binaryMessagesIn: 0, binaryBytesIn: 0, textMessagesIn: 0, textBytesIn: 0
+      binaryMessagesIn: 0, binaryBytesIn: 0, textMessagesIn: 0, textBytesIn: 0,
+      acknowledgementsIn: 0
+  };
+  // When each network step of connecting happened, in milliseconds since this worker started:
+  // every fetch (Nym API or other host, path only) and every gateway socket opening, opening and
+  // closing. Host names and query strings are left out, because they can identify the gateway.
+  const WYM_TIMELINE_LIMIT = 200;
+  const wymTimeline = [];
+  function wymNote(event, details) {
+      if (wymTimeline.length < WYM_TIMELINE_LIMIT) wymTimeline.push(Object.assign({ atMs: Math.round(performance.now()), event: event }, details));
+  }
+  function wymDescribeUrl(url) {
+      try {
+          const parsed = new URL(String(url), self.location.href);
+          const isNymApi = /(^|\.)nymtech\.(net|cc)$/.test(parsed.hostname);
+          return (isNymApi ? 'nym api ' : 'other host ') + parsed.pathname;
+      } catch (error) {
+          return 'unreadable url';
+      }
+  }
+  const wymNativeFetch = self.fetch;
+  self.fetch = function (input, init) {
+      const target = wymDescribeUrl(typeof input === 'string' || input instanceof URL ? input : input && input.url);
+      const startedAtMs = Math.round(performance.now());
+      return wymNativeFetch.call(self, input, init).then(function (response) {
+          wymNote('fetched', { target: target, status: response.status, startedAtMs: startedAtMs });
+          return response;
+      }, function (error) {
+          wymNote('fetch failed', { target: target, startedAtMs: startedAtMs });
+          throw error;
+      });
   };
   function wymMessageByteLength(data) {
       if (typeof data === 'string') return data.length;
@@ -93,6 +130,8 @@ const GATEWAY_SOCKET_TRACKING = `
   }
   function WymTrackedWebSocket(url, protocols) {
       const socket = protocols === undefined ? new WymNativeWebSocket(url) : new WymNativeWebSocket(url, protocols);
+      const openingAtMs = Math.round(performance.now());
+      wymNote('gateway socket opening', {});
       // The WASM glue calls socket.send(...) as a property lookup, so an own property on the
       // instance sees every outgoing message without changing the shared prototype.
       const wymNativeSend = socket.send;
@@ -111,16 +150,20 @@ const GATEWAY_SOCKET_TRACKING = `
               wymGatewayTraffic.textMessagesIn += 1;
               wymGatewayTraffic.textBytesIn += event.data.length;
           } else {
+              const byteLength = wymMessageByteLength(event.data);
               wymGatewayTraffic.binaryMessagesIn += 1;
-              wymGatewayTraffic.binaryBytesIn += wymMessageByteLength(event.data);
+              wymGatewayTraffic.binaryBytesIn += byteLength;
+              if (byteLength <= WYM_ACK_MAX_BYTES) wymGatewayTraffic.acknowledgementsIn += 1;
           }
       });
       socket.addEventListener('open', function () {
           wymTrackedSockets.add(socket);
+          wymNote('gateway socket open', { openingAtMs: openingAtMs });
           wymReportSocketState('open', {});
       });
       socket.addEventListener('close', function (event) {
           wymTrackedSockets.delete(socket);
+          wymNote('gateway socket closed', { code: event.code, openingAtMs: openingAtMs });
           wymReportSocketState('closed', { code: event.code, wasClean: event.wasClean });
       });
       socket.addEventListener('error', function () {
@@ -187,6 +230,10 @@ const WORKER_EDITS = [
     // can compute rates between two samples without mixing the page's and the worker's clocks.
     '          wymGatewayTraffic: function () {\n' +
     '              return Object.assign({ sampledAtMs: performance.now(), openSockets: wymTrackedSockets.size }, wymGatewayTraffic);\n' +
+    '          },\n' +
+    // Returns the connect timeline recorded since this worker started (see wymNote).
+    '          wymConnectTimeline: function () {\n' +
+    '              return wymTimeline.slice();\n' +
     '          },\n' +
     '          rawSend: function (args) {'
   ]
