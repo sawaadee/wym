@@ -497,10 +497,13 @@ const HEALTH_PROBE_MAX_MS = 3000
 const HEALTH_STEADY_ACK_MINIMUM = 0.6
 const HEALTH_CONFIRMING_WINDOWS = 2
 const HEALTH_MIN_PACKETS_PER_WINDOW = 200
-// A gateway's first connection normally opens 1.4 to 3 s after the client starts (gateway test).
-// One that has not opened within this long is abandoned for another gateway: in testing, a single
-// slow gateway made a move take 45 s, 21 s of it waiting for its first connection to open.
-const GATEWAY_SOCKET_OPEN_TIMEOUT_MS = 8000
+// A healthy connect makes visible progress every 1 to 2 s: the registration connection opens 1.4
+// to 3 s after the client starts and closes about a second later, the working connection opens
+// about 1.5 s after that, and the client reports connected about 0.8 s later (gateway test). A
+// connect with no gateway connection event for this long is abandoned for another gateway: in
+// testing, one gateway took 21 s to open its first connection (making a move take 45 s), and
+// another registered but never opened its working connection, holding a start for 30 s.
+const GATEWAY_STALL_TIMEOUT_MS = 8000
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
@@ -851,13 +854,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
   const evaluateHealth = sample => {
     if (node.health.state === 'degraded' || sample.packetsOut < HEALTH_MIN_PACKETS_PER_WINDOW) return
     const acknowledgementReturn = Math.round(sample.acknowledgementsIn / sample.packetsOut * 100) / 100
-    if (node.health.state === 'checking') {
-      if (firstCheck && firstCheck.acknowledgementReturn === null) {
-        firstCheck.acknowledgementReturn = acknowledgementReturn
-        concludeFirstCheck()
-      }
-      return
-    }
+    if (node.health.state === 'checking') return // the first check takes its own readings
     const passed = acknowledgementReturn >= HEALTH_STEADY_ACK_MINIMUM
     const checks = node.health.checks + 1
     const failedWindows = passed ? 0 : node.health.failedWindows + 1
@@ -880,7 +877,19 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     firstCheck = thisCheck
     gatewayTrafficBaseline = null
     sampleGatewayTraffic()
-    firstHealthCheckTimer = setTimeout(sampleGatewayTraffic, HEALTH_FIRST_CHECK_MS)
+    // Its own readings, exactly HEALTH_FIRST_CHECK_MS apart, so the regular 10 s samples cannot
+    // shorten the window (acknowledgements trail their packets by about a second).
+    const generation = clientGeneration
+    const startReading = mixnetClient.client.wymGatewayTraffic().catch(() => null)
+    firstHealthCheckTimer = setTimeout(async () => {
+      const start = await startReading
+      const end = mixnetClient && generation === clientGeneration ? await mixnetClient.client.wymGatewayTraffic().catch(() => null) : null
+      if (firstCheck !== thisCheck || !start || !end) return
+      const packetsOut = end.binaryMessagesOut - start.binaryMessagesOut
+      const acknowledgements = faultInjection.hideAcknowledgementsUntil > Date.now() ? 0 : end.acknowledgementsIn - start.acknowledgementsIn
+      thisCheck.acknowledgementReturn = packetsOut > 0 ? Math.round(acknowledgements / packetsOut * 100) / 100 : 0
+      concludeFirstCheck()
+    }, HEALTH_FIRST_CHECK_MS)
     Promise.all(Array.from({ length: HEALTH_PROBES }, (unused, index) =>
       new Promise(resolve => setTimeout(resolve, index * HEALTH_PROBE_SPACING_MS))
         .then(() => node.probeSelf(HEALTH_PROBE_TIMEOUT_MS))
@@ -1043,10 +1052,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       wakeWait()
     })
     candidate.events.subscribeToRawMessageReceivedEvent(event => { if (generation === clientGeneration) handleRawMessage(event) })
-    let gatewaySocketOpened = false
+    let lastGatewayEventAt = 0
     candidate.events.subscribeToWymSocketState(event => {
       if (generation !== clientGeneration) return
-      if (event.args.state === 'open') gatewaySocketOpened = true
+      lastGatewayEventAt = Date.now()
       handleSocketState(event.args)
       wakeWait()
     })
@@ -1067,8 +1076,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     const onAbort = () => wakeWait()
     abortSignal?.addEventListener('abort', onAbort)
     let gatewayUnresponsive = false
+    const stalledAt = () => Math.max(attemptStartedWall, lastGatewayEventAt) + GATEWAY_STALL_TIMEOUT_MS
     while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration && !abortSignal?.aborted) {
-      if (!gatewaySocketOpened && Date.now() >= attemptStartedWall + GATEWAY_SOCKET_OPEN_TIMEOUT_MS) {
+      if (Date.now() >= stalledAt()) {
         gatewayUnresponsive = true
         break
       }
@@ -1079,7 +1089,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       // Re-check the moving deadline at least once a second; the connected event, an abort or the
       // node stopping (stopConnectWait) end the wait at once.
       await new Promise(resolve => {
-        const nextCheckAt = gatewaySocketOpened ? currentDeadline() : Math.min(currentDeadline(), attemptStartedWall + GATEWAY_SOCKET_OPEN_TIMEOUT_MS)
+        const nextCheckAt = Math.min(currentDeadline(), stalledAt())
         const timer = setTimeout(resolve, Math.max(0, Math.min(1000, nextCheckAt - Date.now())))
         wakeWait = () => { clearTimeout(timer); resolve() }
         stopConnectWait = wakeWait
@@ -1099,9 +1109,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
       throw new Error('The Nym client was stopped while connecting.')
     }
     if (gatewayUnresponsive) {
-      diagnostics.warn('nym', 'the gateway did not answer within ' + GATEWAY_SOCKET_OPEN_TIMEOUT_MS / 1000 + ' s; trying another', { purpose, gateway: preferredGateway ? preferredGateway.slice(0, 6) + '...' : 'chosen by the Nym client' })
+      diagnostics.warn('nym', 'connecting made no progress for ' + GATEWAY_STALL_TIMEOUT_MS / 1000 + ' s; trying another gateway', { purpose, gateway: preferredGateway ? preferredGateway.slice(0, 6) + '...' : 'chosen by the Nym client', gatewayEventsSeen: lastGatewayEventAt > 0 })
       await shutDownClient(candidate, purpose)
-      const error = new Error('The gateway did not answer within ' + GATEWAY_SOCKET_OPEN_TIMEOUT_MS / 1000 + ' seconds.')
+      const error = new Error('The gateway stopped responding while connecting (no progress for ' + GATEWAY_STALL_TIMEOUT_MS / 1000 + ' seconds).')
       error.name = 'GatewayUnresponsiveError'
       throw error
     }
