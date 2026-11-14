@@ -83,6 +83,13 @@ const faultInjection = { dropIncomingDataUntil: 0 }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
+// Control messages can be delayed or lost in the mixnet (one "hello" took almost two minutes in
+// testing), so the recipient repeats "hello" until the sender answers: every
+// HELLO_RETRY_INTERVAL_MS at first, then every HELLO_RETRY_SLOW_INTERVAL_MS after the first
+// minute. Messages slower than SLOW_CONTROL_MESSAGE_MS are logged as warnings.
+const HELLO_RETRY_INTERVAL_MS = 10000
+const HELLO_RETRY_SLOW_INTERVAL_MS = 30000
+const SLOW_CONTROL_MESSAGE_MS = 10000
 const LINK_VERSION = 'v2'
 const LINK_MODE_CODES = { balanced: 'b', maximum: 'm' }
 const MODE_LABELS = { balanced: 'Balanced', maximum: 'Maximum privacy' }
@@ -342,8 +349,10 @@ function setNetworkStatus (state, text) {
 // ---------------------------------------------------------------------------
 // Nym node: one mixnet client, routing control messages and data frames
 // ---------------------------------------------------------------------------
+// Every control message carries the sender's wall-clock time so the log can show how long it
+// spent in the mixnet. Across two machines the figure includes their clock difference.
 function encodeControlMessage (message) {
-  const json = textEncoder.encode(JSON.stringify(message))
+  const json = textEncoder.encode(JSON.stringify(Object.assign({ sentAt: Date.now() }, message)))
   const frame = new Uint8Array(1 + json.length)
   frame[0] = MESSAGE_KIND_CONTROL
   frame.set(json, 1)
@@ -358,6 +367,7 @@ function describeControlMessage (message) {
   if (message?.reason !== undefined) description.reason = message.reason
   if (message?.verified !== undefined) description.verified = message.verified
   if (typeof message?.recipientId === 'string') description.recipient = message.recipientId.slice(0, 6)
+  if (typeof message?.attempt === 'number') description.attempt = message.attempt
   return description
 }
 
@@ -535,7 +545,8 @@ async function createNymNode (mode) {
       return
     }
     node.counters.controlIn += 1
-    diagnostics.info('control', 'received ' + message?.kind, Object.assign(describeControlMessage(message), { replyTag: describeReplyTag(senderTag) }))
+    const transitMs = typeof message?.sentAt === 'number' ? Date.now() - message.sentAt : null
+    diagnostics.log(transitMs !== null && transitMs > SLOW_CONTROL_MESSAGE_MS ? 'warn' : 'info', 'control', 'received ' + message?.kind, Object.assign(describeControlMessage(message), { transitMs, replyTag: describeReplyTag(senderTag) }))
     try {
       node.onControl?.(message, senderTag)
     } catch (error) {
@@ -1197,7 +1208,7 @@ function handleSenderControl (message, senderTag) {
   const linkId = typeof message.linkId === 'string' && /^[0-9a-f]{32}$/.test(message.linkId) ? message.linkId : null
 
   if (message.kind === 'hello') {
-    sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined }, senderTag).catch(() => {})
+    sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined, attempt: typeof message.attempt === 'number' ? message.attempt : undefined }, senderTag).catch(() => {})
   } else if (message.kind === 'open' && linkId) {
     if (limitReached) {
       sendSession.node.replyControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, senderTag).catch(() => {})
@@ -1343,7 +1354,7 @@ async function stopSharing () {
 // recipientId: random per receiving session; the sender counts it against the recipient limit
 // and lets it reopen links after a stall. retiredLinkIds: links replaced after a stall, whose
 // late frames are dropped. stall: the recovery state (see checkReceiverHealth).
-const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null }
+const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0 }
 
 function newStallState () {
   return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0, relinkedAt: 0 }
@@ -1392,15 +1403,34 @@ async function openShareLink (linkText) {
   receiveSession.recipientId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
   receiveSession.node.onControl = (message, senderTag) => handleReceiverControl(message, senderTag)
   receiveSession.node.onData = frame => routeReceiverFrame(frame)
-  receiveSession.helloSentAt = performance.now()
-  // No return address: the sender answers through the reply blocks attached to this message.
-  receiveSession.node.sendControl({ kind: 'hello', infoHash: link.infoHash, recipientId: receiveSession.recipientId }, link.senderAddress).catch(() => {})
+  startHelloRetries()
   clearTimeout(receiveSession.replyTimer)
   receiveSession.replyTimer = setTimeout(() => {
-    diagnostics.warn('receive', 'sender did not answer within ' + SENDER_REPLY_TIMEOUT_MS / 1000 + ' s')
-    setReceiveHeading(elementById('receive-title').textContent, 'The sender did not answer.')
-    showReceiveNotice('warning', 'The sender is not reachable. Their tab may be closed, or they stopped sharing.')
+    diagnostics.warn('receive', 'sender did not answer within ' + SENDER_REPLY_TIMEOUT_MS / 1000 + ' s; still trying', { hellosSent: receiveSession.hellosSent })
+    setReceiveHeading(elementById('receive-title').textContent, 'The sender has not answered yet.')
+    showReceiveNotice('warning', 'The sender is not reachable yet. Their tab may be closed, asleep or offline. This page keeps trying.')
   }, SENDER_REPLY_TIMEOUT_MS)
+}
+
+// Sends "hello" now and repeats it until the sender answers or refuses. Each repeat carries the
+// same recipient id, so the sender counts this recipient once however many arrive.
+function startHelloRetries () {
+  stopHelloRetries()
+  receiveSession.hellosSent = 0
+  receiveSession.helloStartedAt = performance.now()
+  const sendHello = () => {
+    receiveSession.hellosSent += 1
+    receiveSession.helloSentAt = performance.now()
+    // No return address: the sender answers through the reply blocks attached to this message.
+    receiveSession.node.sendControl({ kind: 'hello', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId, attempt: receiveSession.hellosSent }, receiveSession.link.senderAddress).catch(() => {})
+    const waitedMs = performance.now() - receiveSession.helloStartedAt
+    receiveSession.helloTimer = setTimeout(sendHello, waitedMs < SENDER_REPLY_TIMEOUT_MS ? HELLO_RETRY_INTERVAL_MS : HELLO_RETRY_SLOW_INTERVAL_MS)
+  }
+  sendHello()
+}
+function stopHelloRetries () {
+  clearTimeout(receiveSession.helloTimer)
+  receiveSession.helloTimer = null
 }
 
 function handleReceiverControl (message) {
@@ -1420,14 +1450,21 @@ function handleReceiverControl (message) {
     }
     return
   }
+  if (message.kind === 'available' && !receiveSession.helloTimer && !elementById('start-download').disabled) {
+    // Repeated hellos can each be answered; only the first answer matters.
+    diagnostics.info('receive', 'extra answer to an earlier hello', { answeredAttempt: message.attempt ?? null })
+    return
+  }
   if (message.kind === 'available') {
     clearTimeout(receiveSession.replyTimer)
-    diagnostics.info('receive', 'sender is online', { roundTripMs: replyMs })
+    stopHelloRetries()
+    diagnostics.info('receive', 'sender is online', { roundTripMs: replyMs, hellosSent: receiveSession.hellosSent, sinceFirstHelloMs: Math.round(performance.now() - receiveSession.helloStartedAt), answeredAttempt: message.attempt ?? null })
     hideReceiveNotice()
     elementById('receive-subtitle').textContent = 'The sender is online. Files arrive through the Nym mixnet.'
     elementById('start-download').disabled = false
   } else if (message.kind === 'refused') {
     clearTimeout(receiveSession.replyTimer)
+    stopHelloRetries()
     if (receiveSession.downloading) {
       receiveSession.downloading = false
       clearInterval(receiveSession.monitorTimer)
