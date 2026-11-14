@@ -598,7 +598,11 @@ const GATEWAY_DIRECTORY_URL = NYM_API_URL + '/v1/unstable/nym-nodes/skimmed/entr
 const GATEWAY_MINIMUM_PERFORMANCE = 0.95
 const GATEWAY_DIRECTORY_TIMEOUT_MS = 8000
 const GATEWAY_DIRECTORY_MAX_AGE_MS = 30 * 60 * 1000
-const gatewayDirectory = { promise: null, fetchedAt: 0, triedThisPage: new Set() }
+// connectedThisPage: whether any gateway has connected since this page loaded. Until one has, a
+// connect that never hears from its gateway at all may be this network's fault (a firewall that
+// blocks the gateways' port, as in one test environment, stalls every gateway the same way), so
+// such a stall is not held against the gateway.
+const gatewayDirectory = { promise: null, fetchedAt: 0, triedThisPage: new Set(), connectedThisPage: false }
 
 /** The gateway part of a Nym address (after the @), or null. */
 function gatewayOfAddress (address) {
@@ -1177,7 +1181,8 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       throw new Error('The Nym client was stopped while connecting.')
     }
     if (gatewayUnresponsive) {
-      if (rememberFailures && preferredGateway && (!stallThisAttempt || faultInjection.rememberFaultFailures)) {
+      const gatewayToBlame = lastGatewayEventAt > 0 || gatewayDirectory.connectedThisPage
+      if (rememberFailures && preferredGateway && gatewayToBlame && (!stallThisAttempt || faultInjection.rememberFaultFailures)) {
         rememberGatewayFailure({ identity: preferredGateway, performance: await gatewayPerformance(preferredGateway) }, 'stalled while connecting')
       }
       diagnostics.warn('nym', 'connecting made no progress for ' + GATEWAY_STALL_TIMEOUT_MS / 1000 + ' s; trying another gateway', { purpose, gateway: preferredGateway ? preferredGateway.slice(0, 6) + '...' : 'chosen by the Nym client', gatewayEventsSeen: lastGatewayEventAt > 0 })
@@ -1192,6 +1197,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       throw new Error('Could not connect to the Nym network within ' + Math.round((Date.now() - attemptStartedWall) / 1000) + ' seconds.')
     }
     mixnetClient = candidate
+    gatewayDirectory.connectedThisPage = true
     return { address: connectedAddress, ms: Math.round(performance.now() - attemptStartedAt) }
   }
 
