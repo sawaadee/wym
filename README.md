@@ -35,7 +35,9 @@ Open the page, drop in files and send the link. The recipient opens the link, or
 
 ## Testing
 
-The Diagnostics panel logs every step, including how long each control message spent in transit. Opening the page with `?faults=1` adds test controls in the browser console:
+The Diagnostics panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 505 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
+
+Opening the page with `?faults=1` adds test controls in the browser console:
 
 - `nymShareFaults.dropIncomingData(seconds)` discards all incoming data for that long.
 - `nymShareFaults.delayIncomingMessages(milliseconds)` holds every incoming message for that long, imitating a slow path. Pass 0 to stop.

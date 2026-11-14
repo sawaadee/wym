@@ -14,7 +14,8 @@
   It also skips the worker's attempt to decode every message in the SDK's mime-typed format
   (this page only sends raw frames, so every attempt failed with a console error), reports the
   worker's gateway WebSocket open, close and error events to the page (the
-  SDK has no disconnect event), exposes wymCloseGatewaySockets() for fault-injection tests, and
+  SDK has no disconnect event), counts the messages and bytes the worker exchanges with its
+  gateway (wymGatewayTraffic()), exposes wymCloseGatewaySockets() for fault-injection tests, and
   returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
 
   The worker source is decoded and re-encoded as Latin-1 so every byte outside the patched
@@ -76,8 +77,44 @@ const GATEWAY_SOCKET_TRACKING = `
   function wymReportSocketState(state, details) {
       self.postMessage({ kind: 'WymSocketState', args: Object.assign({ state: state, openSockets: wymTrackedSockets.size }, details) });
   }
+  // Cumulative gateway traffic of this worker, across every socket it has opened. The Nym gateway
+  // client sends each Sphinx packet as one binary WebSocket message and every request or
+  // response as a text message, so binary messages out count mix packets (real and cover).
+  // Ping frames are handled by the browser and never reach these counters.
+  const wymGatewayTraffic = {
+      binaryMessagesOut: 0, binaryBytesOut: 0, textMessagesOut: 0, textBytesOut: 0,
+      binaryMessagesIn: 0, binaryBytesIn: 0, textMessagesIn: 0, textBytesIn: 0
+  };
+  function wymMessageByteLength(data) {
+      if (typeof data === 'string') return data.length;
+      if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return data.byteLength;
+      if (typeof Blob !== 'undefined' && data instanceof Blob) return data.size;
+      return 0;
+  }
   function WymTrackedWebSocket(url, protocols) {
       const socket = protocols === undefined ? new WymNativeWebSocket(url) : new WymNativeWebSocket(url, protocols);
+      // The WASM glue calls socket.send(...) as a property lookup, so an own property on the
+      // instance sees every outgoing message without changing the shared prototype.
+      const wymNativeSend = socket.send;
+      socket.send = function (data) {
+          if (typeof data === 'string') {
+              wymGatewayTraffic.textMessagesOut += 1;
+              wymGatewayTraffic.textBytesOut += data.length;
+          } else {
+              wymGatewayTraffic.binaryMessagesOut += 1;
+              wymGatewayTraffic.binaryBytesOut += wymMessageByteLength(data);
+          }
+          return wymNativeSend.call(socket, data);
+      };
+      socket.addEventListener('message', function (event) {
+          if (typeof event.data === 'string') {
+              wymGatewayTraffic.textMessagesIn += 1;
+              wymGatewayTraffic.textBytesIn += event.data.length;
+          } else {
+              wymGatewayTraffic.binaryMessagesIn += 1;
+              wymGatewayTraffic.binaryBytesIn += wymMessageByteLength(event.data);
+          }
+      });
       socket.addEventListener('open', function () {
           wymTrackedSockets.add(socket);
           wymReportSocketState('open', {});
@@ -145,6 +182,11 @@ const WORKER_EDITS = [
     '              const count = wymTrackedSockets.size;\n' +
     "              wymTrackedSockets.forEach(function (socket) { socket.close(4000, 'fault injection'); });\n" +
     '              return count;\n' +
+    '          },\n' +
+    // Returns the cumulative gateway traffic counters with the worker's own clock, so the page
+    // can compute rates between two samples without mixing the page's and the worker's clocks.
+    '          wymGatewayTraffic: function () {\n' +
+    '              return Object.assign({ sampledAtMs: performance.now(), openSockets: wymTrackedSockets.size }, wymGatewayTraffic);\n' +
     '          },\n' +
     '          rawSend: function (args) {'
   ]

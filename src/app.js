@@ -413,6 +413,16 @@ const NYM_RECONNECT_MAX_DELAY_MS = 30000
 // therefore ask for the current gateway first, and only fall back to a new one after this many
 // failed attempts (the gateway itself may be down).
 const NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS = 3
+// Gateway traffic measurement (wymGatewayTraffic in build/nym-reply-patch.mjs). Nym's client
+// defaults, from common/client-core/config-types: one packet (real or cover) every 20 ms on
+// average in the main Poisson stream, plus one loop cover packet every 200 ms. The expected
+// rate for a mode is the sum of both streams. Samples are taken every 10 s; busy windows are
+// logged each sample, idle windows every 60 s (the first one after connecting after 10 s), so an
+// idle sender tab adds about one entry a minute.
+const NYM_DEFAULT_MESSAGE_STREAM_DELAY_MS = 20
+const NYM_DEFAULT_LOOP_COVER_DELAY_MS = 200
+const GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS = 10000
+const GATEWAY_TRAFFIC_IDLE_LOG_INTERVAL_MS = 60000
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
@@ -509,6 +519,103 @@ async function createNymNode (mode) {
   let socketLostAt = 0
   let lastSocketActivityAt = 0
   let reconnectPromise = null
+
+  // ---- Gateway traffic measurement ------------------------------------------------------------
+  // Every GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS the worker's cumulative counters are read and the
+  // difference to the previous reading becomes one sample. A sample is "busy" when any data or
+  // control message crossed the mixnet in it, otherwise "idle". Consecutive samples of the same
+  // phase are merged into a window that is logged as one 'gateway traffic' entry, and running
+  // per-phase totals are kept so every entry also carries the averages so far.
+  const streamDelayMs = NYM_CLIENT_OVERRIDES[mode]?.traffic?.messageSendingAverageDelayMs ?? NYM_DEFAULT_MESSAGE_STREAM_DELAY_MS
+  const expectedPacketsOutPerSecond = 1000 / streamDelayMs + 1000 / NYM_DEFAULT_LOOP_COVER_DELAY_MS
+  const createTrafficTotals = () => ({ milliseconds: 0, packetsOut: 0, bytesOut: 0, packetsIn: 0, bytesIn: 0, textMessagesOut: 0, textMessagesIn: 0, hiddenSamples: 0, samples: 0 })
+  const gatewayTrafficTotals = { idle: createTrafficTotals(), busy: createTrafficTotals() }
+  let gatewayTrafficBaseline = null
+  let gatewayTrafficWindow = null
+  let gatewayTrafficSampleInFlight = false
+  let idleWindowsLoggedSinceConnect = 0
+
+  const addTrafficTotals = (target, source) => {
+    for (const key of Object.keys(target)) target[key] += source[key]
+  }
+  const describeTrafficRates = totals => {
+    const seconds = totals.milliseconds / 1000
+    if (seconds <= 0) return null
+    return {
+      seconds: Math.round(seconds),
+      packetsOutPerSecond: Math.round(totals.packetsOut / seconds * 10) / 10,
+      megabitsOutPerSecond: Math.round(totals.bytesOut * 8 / seconds / 1e4) / 100,
+      averagePacketBytesOut: totals.packetsOut > 0 ? Math.round(totals.bytesOut / totals.packetsOut) : null,
+      packetsInPerSecond: Math.round(totals.packetsIn / seconds * 10) / 10,
+      megabitsInPerSecond: Math.round(totals.bytesIn * 8 / seconds / 1e4) / 100,
+      percentOfExpectedOut: Math.round(totals.packetsOut / seconds / expectedPacketsOutPerSecond * 100),
+      tabHiddenSamples: totals.hiddenSamples,
+      samples: totals.samples
+    }
+  }
+  node.describeGatewayTraffic = () => ({
+    mode,
+    expectedPacketsOutPerSecond: Math.round(expectedPacketsOutPerSecond * 10) / 10,
+    idle: describeTrafficRates(gatewayTrafficTotals.idle),
+    busy: describeTrafficRates(gatewayTrafficTotals.busy)
+  })
+
+  const flushGatewayTrafficWindow = () => {
+    const finishedWindow = gatewayTrafficWindow
+    gatewayTrafficWindow = null
+    if (!finishedWindow || finishedWindow.totals.samples === 0) return
+    addTrafficTotals(gatewayTrafficTotals[finishedWindow.phase], finishedWindow.totals)
+    if (finishedWindow.phase === 'idle') idleWindowsLoggedSinceConnect += 1
+    diagnostics.info('wire', 'gateway traffic', Object.assign(
+      { phase: finishedWindow.phase },
+      describeTrafficRates(finishedWindow.totals),
+      { textMessagesOut: finishedWindow.totals.textMessagesOut, textMessagesIn: finishedWindow.totals.textMessagesIn, averagesSoFar: node.describeGatewayTraffic() }
+    ))
+  }
+
+  // Readings from an earlier client (a replaced worker starts its counters at zero) or taken
+  // while the node was not connected are never subtracted from each other.
+  const sampleGatewayTraffic = async () => {
+    if (gatewayTrafficSampleInFlight) return
+    if (node.state !== 'connected' || !mixnetClient) {
+      flushGatewayTrafficWindow()
+      gatewayTrafficBaseline = null
+      idleWindowsLoggedSinceConnect = 0
+      return
+    }
+    gatewayTrafficSampleInFlight = true
+    const generation = clientGeneration
+    try {
+      const reading = await mixnetClient.client.wymGatewayTraffic()
+      if (generation !== clientGeneration || node.state !== 'connected') return
+      const messageCounts = node.counters.dataFramesIn + node.counters.dataFramesOut + node.counters.controlIn + node.counters.controlOut
+      const baseline = gatewayTrafficBaseline
+      gatewayTrafficBaseline = { generation, reading, messageCounts }
+      if (!baseline || baseline.generation !== generation || reading.binaryMessagesOut < baseline.reading.binaryMessagesOut) return
+      const phase = messageCounts !== baseline.messageCounts ? 'busy' : 'idle'
+      const sample = {
+        milliseconds: reading.sampledAtMs - baseline.reading.sampledAtMs,
+        packetsOut: reading.binaryMessagesOut - baseline.reading.binaryMessagesOut,
+        bytesOut: reading.binaryBytesOut - baseline.reading.binaryBytesOut,
+        packetsIn: reading.binaryMessagesIn - baseline.reading.binaryMessagesIn,
+        bytesIn: reading.binaryBytesIn - baseline.reading.binaryBytesIn,
+        textMessagesOut: reading.textMessagesOut - baseline.reading.textMessagesOut,
+        textMessagesIn: reading.textMessagesIn - baseline.reading.textMessagesIn,
+        hiddenSamples: document.visibilityState === 'hidden' ? 1 : 0,
+        samples: 1
+      }
+      if (gatewayTrafficWindow && gatewayTrafficWindow.phase !== phase) flushGatewayTrafficWindow()
+      if (!gatewayTrafficWindow) gatewayTrafficWindow = { phase, totals: createTrafficTotals() }
+      addTrafficTotals(gatewayTrafficWindow.totals, sample)
+      const logAfterMs = phase === 'busy' || idleWindowsLoggedSinceConnect === 0 ? GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS : GATEWAY_TRAFFIC_IDLE_LOG_INTERVAL_MS
+      if (gatewayTrafficWindow.totals.milliseconds >= logAfterMs) flushGatewayTrafficWindow()
+    } catch (error) {
+      diagnostics.warn('wire', 'gateway traffic sample failed', error)
+    } finally {
+      gatewayTrafficSampleInFlight = false
+    }
+  }
+  const gatewayTrafficTimer = setInterval(sampleGatewayTraffic, GATEWAY_TRAFFIC_SAMPLE_INTERVAL_MS)
 
   const setState = state => {
     node.state = state
@@ -754,7 +861,9 @@ async function createNymNode (mode) {
   // Test hook, reachable only through the ?faults=1 controls.
   node.closeGatewaySocketsForTest = async () => (mixnetClient ? mixnetClient.client.wymCloseGatewaySockets() : 0)
   node.stop = async () => {
-    diagnostics.info('nym', 'stopping client', node.counters)
+    clearInterval(gatewayTrafficTimer)
+    flushGatewayTrafficWindow()
+    diagnostics.info('nym', 'stopping client', Object.assign({}, node.counters, { gatewayTraffic: node.describeGatewayTraffic() }))
     setState('stopped')
     clearTimeout(socketGraceTimer)
     socketGraceTimer = null
@@ -1277,7 +1386,7 @@ function handleSenderControl (message, senderTag) {
     if (sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'closed by the recipient')
   } else if (message.kind === 'complete') {
     sendSession.finished.add(recipientId)
-    diagnostics.info('send', 'recipient finished', { finished: sendSession.finished.size, verified: message.verified })
+    diagnostics.info('send', 'recipient finished', { finished: sendSession.finished.size, verified: message.verified, gatewayTraffic: sendSession.node?.describeGatewayTraffic() })
     // The recipient has destroyed its side, but nothing travels back over the mixnet to tell
     // this link stream. Close it here so the wire, the Connected count and the logs settle.
     if (linkId && sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'recipient finished')
@@ -1721,7 +1830,8 @@ async function finishDownload (torrent) {
     relinks: receiveSession.stall.relinks,
     senderChecks: receiveSession.stall.senderChecks,
     lateFramesDropped: receiveSession.lateFramesDropped,
-    nym: receiveSession.node.counters
+    nym: receiveSession.node.counters,
+    gatewayTraffic: receiveSession.node.describeGatewayTraffic()
   })
   elementById('receive-progress').style.width = '100%'
   elementById('receive-subtitle').textContent = 'Decrypting and checking the files.'
