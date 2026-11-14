@@ -1,0 +1,6 @@
+# .gitattributes
+# Purpose: keep the built page byte-for-byte identical on every checkout so its published
+# checksum stays valid, and mark it as generated so diffs show the source instead.
+# Created: 2026-11-14
+docs/index.html -text -diff linguist-generated=true
+docs/SHA256SUMS -text

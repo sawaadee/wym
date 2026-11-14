@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<!--
+  src/page.html
+  Purpose: markup and styles for Nym Share. build.mjs bundles src/app.js with every library it
+  uses and inlines the result at the APP_SCRIPT marker, producing the single self-contained
+  docs/index.html that GitHub Pages serves. Nothing is loaded from a CDN at runtime.
+  Created: 2026-11-14
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Nym Share</title>
+<style>
+  :root {
+    --page-background: #f5f5f7;
+    --surface: #ffffff;
+    --surface-secondary: #f5f5f7;
+    --border: #d2d2d7;
+    --text-primary: #1d1d1f;
+    --text-secondary: #6e6e73;
+    --accent: #0071e3;
+    --accent-pressed: #0062c4;
+    --accent-text: #ffffff;
+    --positive: #1f8a3b;
+    --negative: #d70015;
+    --warning: #b25000;
+    --progress-track: #e8e8ed;
+    --radius-large: 18px;
+    --radius-medium: 12px;
+    --radius-small: 8px;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-background: #000000;
+      --surface: #1c1c1e;
+      --surface-secondary: #2c2c2e;
+      --border: #3a3a3c;
+      --text-primary: #f5f5f7;
+      --text-secondary: #a1a1a6;
+      --accent: #0a84ff;
+      --accent-pressed: #0071e3;
+      --positive: #30d158;
+      --negative: #ff453a;
+      --warning: #ff9f0a;
+      --progress-track: #3a3a3c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: var(--page-background);
+    color: var(--text-primary);
+    font-size: 15px;
+    line-height: 1.47;
+    -webkit-font-smoothing: antialiased;
+  }
+  .app-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 24px 20px 8px;
+  }
+  .app-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .app-title svg { width: 22px; height: 22px; }
+  .network-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .network-status .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); }
+  .network-status[data-state="connected"] .status-dot { background: var(--positive); }
+  .network-status[data-state="failed"] .status-dot { background: var(--negative); }
+  main { max-width: 640px; margin: 0 auto; padding: 8px 20px 48px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-large);
+    padding: 24px;
+    margin-top: 16px;
+  }
+  .card h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 6px; }
+  .card h2 { font-size: 17px; font-weight: 600; margin: 0 0 12px; }
+  .muted { color: var(--text-secondary); }
+  .small { font-size: 13px; }
+  .hidden { display: none !important; }
+  .drop-zone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 200px;
+    border: 1.5px dashed var(--border);
+    border-radius: var(--radius-medium);
+    background: var(--surface-secondary);
+    text-align: center;
+    padding: 24px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+  }
+  .drop-zone:hover, .drop-zone:focus-visible, .drop-zone[data-dragging="true"] { border-color: var(--accent); outline: none; }
+  .drop-zone svg { width: 32px; height: 32px; color: var(--accent); }
+  .drop-zone strong { font-size: 17px; font-weight: 600; }
+  .options-row { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
+  .field { display: flex; flex-direction: column; gap: 6px; flex: 1 1 200px; }
+  .field label { font-size: 13px; color: var(--text-secondary); }
+  select, input[type="text"] {
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--surface-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-small);
+    padding: 9px 12px;
+    width: 100%;
+  }
+  select:focus-visible, input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font: inherit;
+    font-weight: 500;
+    border-radius: 999px;
+    padding: 9px 18px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .button svg { width: 16px; height: 16px; }
+  .button-primary { background: var(--accent); color: var(--accent-text); }
+  .button-primary:hover { background: var(--accent-pressed); }
+  .button-secondary { background: var(--surface-secondary); color: var(--text-primary); border-color: var(--border); }
+  .button-destructive { background: transparent; color: var(--negative); border-color: var(--border); }
+  .button:disabled { opacity: 0.45; cursor: default; }
+  .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+  .link-row { display: flex; gap: 10px; margin-top: 12px; }
+  .link-row input { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+  .file-list { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--border); }
+  .file-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .file-row svg { width: 20px; height: 20px; color: var(--text-secondary); flex: none; }
+  .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .file-size { color: var(--text-secondary); font-size: 13px; flex: none; }
+  .verified { display: inline-flex; align-items: center; gap: 4px; color: var(--positive); font-size: 13px; flex: none; }
+  .verified svg { width: 14px; height: 14px; color: var(--positive); }
+  .progress-track { height: 6px; border-radius: 999px; background: var(--progress-track); overflow: hidden; margin-top: 16px; }
+  .progress-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.3s ease; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-top: 16px; }
+  .stat { background: var(--surface-secondary); border-radius: var(--radius-medium); padding: 12px; }
+  .stat-label { font-size: 12px; color: var(--text-secondary); }
+  .stat-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .notice { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; padding: 12px 14px; border-radius: var(--radius-medium); background: var(--surface-secondary); font-size: 13px; }
+  .notice svg { width: 18px; height: 18px; flex: none; margin-top: 1px; color: var(--text-secondary); }
+  .notice[data-tone="error"] svg, .notice[data-tone="error"] { color: var(--negative); }
+  .notice[data-tone="warning"] svg { color: var(--warning); }
+  .qr-image { display: block; margin: 16px auto 0; width: 200px; height: 200px; border-radius: var(--radius-small); background: #ffffff; padding: 8px; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .progress-fill { transition: none; } }
+  .facts { margin: 16px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+  .facts li { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text-secondary); }
+  .facts svg { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--text-secondary); }
+  .diagnostics summary { cursor: pointer; font-weight: 600; font-size: 15px; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .diagnostics summary::-webkit-details-marker { display: none; }
+  .diagnostics summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+  .diagnostics-count { font-weight: 400; font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .log-output {
+    margin: 12px 0 0;
+    max-height: 360px;
+    overflow: auto;
+    padding: 12px;
+    border-radius: var(--radius-small);
+    background: var(--surface-secondary);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-level-warn { color: var(--warning); }
+  .log-level-error { color: var(--negative); }
+</style>
+</head>
+<body>
+<header class="app-header">
+  <div class="app-title"><i data-lucide="shield-check"></i><span>Nym Share</span></div>
+  <div class="network-status" id="network-status" data-state="connecting" role="status" aria-live="polite">
+    <span class="status-dot"></span><span id="network-status-text">Connecting to Nym</span>
+  </div>
+</header>
+
+<main>
+  <!-- Send: choose files -->
+  <section id="view-choose">
+    <div class="card">
+      <h1>Send files privately</h1>
+      <p class="muted">Files are encrypted in your browser and sent through the Nym mixnet. The recipient never sees your IP address, and you never see theirs.</p>
+      <div class="drop-zone" id="drop-zone" tabindex="0" role="button" aria-label="Choose files to send">
+        <i data-lucide="upload"></i>
+        <strong>Drop files here</strong>
+        <span class="muted small">or click to choose</span>
+      </div>
+      <input type="file" id="file-input" multiple class="hidden">
+      <div class="options-row">
+        <div class="field">
+          <label for="recipient-limit">Recipients</label>
+          <select id="recipient-limit">
+            <option value="1">1 recipient</option>
+            <option value="5" selected>Up to 5</option>
+            <option value="10">Up to 10</option>
+            <option value="0">No limit</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="privacy-mode">Network mode</label>
+          <select id="privacy-mode">
+            <option value="balanced" selected>Balanced, somewhat faster</option>
+            <option value="maximum">Maximum privacy, Nym defaults</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Receive files</h2>
+      <p class="muted small">Paste a Nym Share link you were sent.</p>
+      <form class="link-row" id="paste-form">
+        <input type="text" id="paste-input" placeholder="Paste link" autocomplete="off" spellcheck="false" aria-label="Share link">
+        <button class="button button-secondary" type="submit"><i data-lucide="arrow-right"></i>Open</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- Send: sharing -->
+  <section id="view-share" class="hidden">
+    <div class="card">
+      <h1 id="share-title">Encrypting</h1>
+      <p class="muted" id="share-subtitle">Preparing your files.</p>
+      <div class="progress-track" id="encrypt-progress-track"><div class="progress-fill" id="encrypt-progress"></div></div>
+      <div id="share-ready" class="hidden">
+        <div class="link-row">
+          <input type="text" id="share-link" readonly aria-label="Share link">
+          <button class="button button-primary" id="copy-link" type="button"><i data-lucide="copy"></i><span>Copy</span></button>
+        </div>
+        <div class="button-row">
+          <button class="button button-secondary" id="toggle-qr" type="button"><i data-lucide="qr-code"></i>QR code</button>
+          <button class="button button-destructive" id="stop-sharing" type="button"><i data-lucide="circle-x"></i>Stop sharing</button>
+        </div>
+        <img class="qr-image hidden" id="qr-image" alt="QR code of the share link">
+        <div class="stats-grid">
+          <div class="stat"><div class="stat-label">Connected</div><div class="stat-value" id="stat-connected">0</div></div>
+          <div class="stat"><div class="stat-label">Finished</div><div class="stat-value" id="stat-finished">0</div></div>
+          <div class="stat"><div class="stat-label">Sent</div><div class="stat-value" id="stat-sent">0 B</div></div>
+          <div class="stat"><div class="stat-label">Upload</div><div class="stat-value" id="stat-upload">0 B/s</div></div>
+        </div>
+        <div class="notice" data-tone="warning"><i data-lucide="triangle-alert"></i><span>Keep this tab open. Files go straight from this tab to each recipient, and nothing is stored on a server.</span></div>
+      </div>
+      <ul class="file-list" id="share-file-list"></ul>
+    </div>
+  </section>
+
+  <!-- Receive -->
+  <section id="view-receive" class="hidden">
+    <div class="card">
+      <h1 id="receive-title">Files for you</h1>
+      <p class="muted" id="receive-subtitle">Checking whether the sender is online.</p>
+      <p class="muted small" id="receive-mode"></p>
+      <ul class="file-list" id="receive-file-list"></ul>
+      <div class="progress-track hidden" id="receive-progress-track"><div class="progress-fill" id="receive-progress"></div></div>
+      <div class="stats-grid hidden" id="receive-stats">
+        <div class="stat"><div class="stat-label">Received</div><div class="stat-value" id="stat-received">0 B</div></div>
+        <div class="stat"><div class="stat-label">Speed</div><div class="stat-value" id="stat-download">0 B/s</div></div>
+        <div class="stat"><div class="stat-label">Time left</div><div class="stat-value" id="stat-eta">Estimating</div></div>
+      </div>
+      <div class="button-row">
+        <button class="button button-primary" id="start-download" type="button" disabled><i data-lucide="download"></i>Download</button>
+        <button class="button button-secondary hidden" id="save-all" type="button"><i data-lucide="download"></i>Save all</button>
+      </div>
+      <div class="notice hidden" id="receive-notice"><i data-lucide="info"></i><span id="receive-notice-text"></span></div>
+    </div>
+  </section>
+
+  <ul class="facts">
+    <li><i data-lucide="lock"></i><span>Encrypted in the browser with AES-128-GCM. The key is only in the link, after the #, which browsers never send to a server.</span></li>
+    <li><i data-lucide="eye-off"></i><span>Every byte between sender and recipient goes through the Nym mixnet. Peers only know each other's Nym address.</span></li>
+    <li><i data-lucide="gauge"></i><span>A mixnet trades speed for privacy. In testing, a 1 MB file took about 40 seconds.</span></li>
+  </ul>
+
+  <!-- Diagnostics: a session log for testing. It never contains keys, links, file names or full Nym addresses. -->
+  <details class="card diagnostics" id="diagnostics">
+    <summary><span>Diagnostics</span><span class="diagnostics-count" id="log-count">0 entries</span></summary>
+    <p class="muted small">A timestamped record of this session for testing. Keys, links, file names and full Nym addresses are never written to it.</p>
+    <div class="button-row">
+      <button class="button button-secondary" id="copy-logs" type="button"><i data-lucide="clipboard-copy"></i><span>Copy log</span></button>
+      <button class="button button-secondary" id="save-logs" type="button"><i data-lucide="file-down"></i>Save log</button>
+      <button class="button button-secondary" id="clear-logs" type="button"><i data-lucide="eraser"></i>Clear</button>
+    </div>
+    <div class="log-output" id="log-output" role="log" aria-live="off"></div>
+  </details>
+</main>
+
+<!-- APP_SCRIPT -->
+</body>
+</html>
