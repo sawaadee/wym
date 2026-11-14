@@ -383,6 +383,11 @@ const NYM_CONNECT_ATTEMPTS = 3
 const NYM_INTERNAL_RECONNECT_GRACE_MS = 15000
 const NYM_SEND_WAIT_MS = 90000
 const NYM_RECONNECT_MAX_DELAY_MS = 30000
+// The Nym WASM client registers with a new gateway on every start unless it is given a preferred
+// one, and a new gateway means a new address, which breaks links already shared. Reconnects
+// therefore ask for the current gateway first, and only fall back to a new one after this many
+// failed attempts (the gateway itself may be down).
+const NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS = 3
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
@@ -575,7 +580,7 @@ async function createNymNode (mode) {
 
   // Starts a Nym client under this node's clientId and waits for its gateway connection.
   // Events from a client that has since been replaced are ignored.
-  const startClient = async purpose => {
+  const startClient = async (purpose, preferredGateway) => {
     const generation = ++clientGeneration
     const attemptStartedAt = performance.now()
     const { createNymMixnetClient } = await loadLibraries()
@@ -586,13 +591,14 @@ async function createNymNode (mode) {
     candidate.events.subscribeToWymSocketState(event => { if (generation === clientGeneration) handleSocketState(event.args) })
     const startOptions = { clientId, nymApiUrl: NYM_API_URL, forceTls: true }
     if (NYM_CLIENT_OVERRIDES[mode]) startOptions.clientOverride = NYM_CLIENT_OVERRIDES[mode]
+    if (preferredGateway) startOptions.preferredGateway = preferredGateway
     try {
       await candidate.client.start(startOptions)
     } catch (error) {
       await shutDownClient(candidate, purpose)
       throw error
     }
-    diagnostics.info('nym', 'client started, waiting for gateway', { purpose, ms: Math.round(performance.now() - attemptStartedAt) })
+    diagnostics.info('nym', 'client started, waiting for gateway', { purpose, sameGatewayRequested: Boolean(preferredGateway), ms: Math.round(performance.now() - attemptStartedAt) })
     const deadline = Date.now() + NYM_CONNECT_ATTEMPT_TIMEOUT_MS
     while (!connectedAddress && Date.now() < deadline && generation === clientGeneration) await new Promise(resolve => setTimeout(resolve, 200))
     if (generation !== clientGeneration || node.state === 'stopped') {
@@ -633,9 +639,13 @@ async function createNymNode (mode) {
       const previousClient = mixnetClient
       mixnetClient = null
       if (previousClient) await shutDownClient(previousClient, 'replaced')
+      // The gateway is the part of the address after "@".
+      const currentGateway = String(node.address).split('@')[1] || null
       for (let attempt = 1; node.state === 'reconnecting'; attempt += 1) {
+        const keepGateway = Boolean(currentGateway) && attempt <= NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS
+        if (attempt === NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS + 1) diagnostics.warn('nym', 'the current gateway did not accept ' + NYM_RECONNECT_SAME_GATEWAY_ATTEMPTS + ' reconnects; trying a new gateway, which changes the address')
         try {
-          const { address, ms } = await startClient('reconnect')
+          const { address, ms } = await startClient('reconnect', keepGateway ? currentGateway : null)
           node.counters.reconnects += 1
           const sameAddress = address === node.address
           diagnostics.info('nym', 'reconnected', { attempt, ms, totalMs: Math.round(performance.now() - reconnectStartedAt), sameAddress })
