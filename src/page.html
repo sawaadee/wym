@@ -9,27 +9,40 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <title>Nym Share</title>
 <style>
   :root {
     --page-background: #f5f5f7;
     --surface: #ffffff;
     --surface-secondary: #f5f5f7;
+    --surface-pressed: #e8e8ed;
     --border: #d2d2d7;
+    --separator: #e5e5ea;
     --text-primary: #1d1d1f;
     --text-secondary: #6e6e73;
+    --text-tertiary: #86868b;
     --accent: #0071e3;
     --accent-pressed: #0062c4;
     --accent-text: #ffffff;
+    --accent-subtle: rgba(0, 113, 227, 0.1);
     --positive: #1f8a3b;
+    --positive-subtle: rgba(31, 138, 59, 0.1);
     --negative: #d70015;
+    --negative-subtle: rgba(215, 0, 21, 0.08);
     --warning: #b25000;
+    --warning-subtle: rgba(178, 80, 0, 0.1);
     --progress-track: #e8e8ed;
+    --backdrop: rgba(0, 0, 0, 0.32);
     --radius-large: 18px;
     --radius-medium: 12px;
-    --radius-small: 8px;
+    --radius-small: 10px;
+    --control-height: 44px;
+    --page-padding: 20px;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
@@ -37,19 +50,28 @@
       --page-background: #000000;
       --surface: #1c1c1e;
       --surface-secondary: #2c2c2e;
+      --surface-pressed: #3a3a3c;
       --border: #3a3a3c;
+      --separator: #38383a;
       --text-primary: #f5f5f7;
       --text-secondary: #a1a1a6;
+      --text-tertiary: #8e8e93;
       --accent: #0a84ff;
       --accent-pressed: #0071e3;
+      --accent-subtle: rgba(10, 132, 255, 0.16);
       --positive: #30d158;
+      --positive-subtle: rgba(48, 209, 88, 0.14);
       --negative: #ff453a;
+      --negative-subtle: rgba(255, 69, 58, 0.14);
       --warning: #ff9f0a;
+      --warning-subtle: rgba(255, 159, 10, 0.14);
       --progress-track: #3a3a3c;
+      --backdrop: rgba(0, 0, 0, 0.56);
     }
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
     background: var(--page-background);
@@ -57,39 +79,63 @@
     font-size: 15px;
     line-height: 1.47;
     -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
   }
+  button, select, input { font: inherit; color: inherit; }
+  .hidden { display: none !important; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+  /* ---- Header: title, connection status and network mode ---------------------------------- */
   .app-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 12px;
     max-width: 640px;
     margin: 0 auto;
-    padding: 24px 20px 8px;
+    padding: calc(20px + env(safe-area-inset-top)) calc(var(--page-padding) + env(safe-area-inset-right)) 4px calc(var(--page-padding) + env(safe-area-inset-left));
   }
-  .app-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 19px;
-    font-weight: 600;
-    letter-spacing: -0.01em;
-  }
-  .app-title svg { width: 22px; height: 22px; }
-  .network-status {
+  .app-title { display: flex; align-items: center; gap: 8px; font-size: 19px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; }
+  .app-title svg { width: 22px; height: 22px; color: var(--accent); }
+  /* One pill: status on the left, mode menu on the right, divided by a hairline. */
+  .network-control {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
+    min-height: 36px;
     border-radius: 999px;
     background: var(--surface);
     border: 1px solid var(--border);
     font-size: 13px;
     color: var(--text-secondary);
+    white-space: nowrap;
   }
-  .network-status .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary); }
+  .network-status { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px 0 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-tertiary); flex: none; }
+  .network-status[data-state="connecting"] .status-dot { background: var(--warning); animation: pulse 1.4s ease-in-out infinite; }
   .network-status[data-state="connected"] .status-dot { background: var(--positive); }
+  .network-status[data-state="paused"] .status-dot { background: var(--text-tertiary); }
   .network-status[data-state="failed"] .status-dot { background: var(--negative); }
-  main { max-width: 640px; margin: 0 auto; padding: 8px 20px 48px; }
+  .network-mode-field { position: relative; display: inline-flex; align-items: center; border-left: 1px solid var(--separator); }
+  .network-mode-field select {
+    max-width: 46vw;
+    text-overflow: ellipsis;
+    appearance: none;
+    -webkit-appearance: none;
+    border: 0;
+    background: transparent;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    padding: 0 30px 0 10px;
+    min-height: 34px;
+    border-radius: 0 999px 999px 0;
+    cursor: pointer;
+  }
+  .network-mode-field select:disabled { color: var(--text-tertiary); cursor: default; }
+  .network-mode-field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .network-mode-field .select-chevron { right: 10px; width: 14px; height: 14px; }
+
+  main { max-width: 640px; margin: 0 auto; padding: 4px calc(var(--page-padding) + env(safe-area-inset-right)) calc(48px + env(safe-area-inset-bottom)) calc(var(--page-padding) + env(safe-area-inset-left)); }
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -97,18 +143,45 @@
     padding: 24px;
     margin-top: 16px;
   }
-  .card h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 6px; }
-  .card h2 { font-size: 17px; font-weight: 600; margin: 0 0 12px; }
+  .card h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 6px; line-height: 1.2; }
+  .card h2 { font-size: 17px; font-weight: 600; margin: 0; }
+  .card p { margin: 0; }
   .muted { color: var(--text-secondary); }
   .small { font-size: 13px; }
-  .hidden { display: none !important; }
+  .section { margin-top: 24px; }
+  .section-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .section-meta { font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+  /* ---- Navigation button in a card (Back, Cancel, Done) ------------------------------------ */
+  .card-nav { display: flex; align-items: center; justify-content: space-between; margin: -8px -10px 12px; }
+  .nav-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    min-height: var(--control-height);
+    padding: 0 10px;
+    border: 0;
+    border-radius: var(--radius-small);
+    background: transparent;
+    color: var(--accent);
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .nav-button svg { width: 20px; height: 20px; }
+  .nav-button:hover { background: var(--accent-subtle); }
+  .nav-button[data-tone="destructive"] { color: var(--negative); }
+  .nav-button[data-tone="destructive"]:hover { background: var(--negative-subtle); }
+  .nav-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+
+  /* ---- Drop zone ---------------------------------------------------------------------------- */
   .drop-zone {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    gap: 8px;
     min-height: 200px;
+    margin-top: 20px;
     border: 1.5px dashed var(--border);
     border-radius: var(--radius-medium);
     background: var(--surface-secondary);
@@ -117,73 +190,148 @@
     cursor: pointer;
     transition: border-color 0.15s ease, background-color 0.15s ease;
   }
-  .drop-zone:hover, .drop-zone:focus-visible, .drop-zone[data-dragging="true"] { border-color: var(--accent); outline: none; }
+  .drop-zone:hover, .drop-zone:focus-visible { border-color: var(--accent); outline: none; }
+  .drop-zone[data-dragging="true"] { border-color: var(--accent); background: var(--accent-subtle); }
+  .drop-zone:active { background: var(--surface-pressed); }
   .drop-zone svg { width: 32px; height: 32px; color: var(--accent); }
   .drop-zone strong { font-size: 17px; font-weight: 600; }
+  /* Touch screens have nothing to drop, so they get "Choose files" instead. */
+  .touch-only { display: none; }
+  @media (hover: none) and (pointer: coarse) {
+    .pointer-only { display: none; }
+    .touch-only { display: inline; }
+  }
+
+  /* ---- Fields and dropdowns ----------------------------------------------------------------- */
   .options-row { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; }
   .field { display: flex; flex-direction: column; gap: 6px; flex: 1 1 200px; }
   .field label { font-size: 13px; color: var(--text-secondary); }
-  select, input[type="text"] {
-    font: inherit;
+  .select-field { position: relative; display: flex; align-items: center; }
+  .select-chevron { position: absolute; right: 12px; width: 16px; height: 16px; color: var(--text-secondary); pointer-events: none; }
+  .select-field select, input[type="text"] {
+    width: 100%;
+    min-height: var(--control-height);
     color: var(--text-primary);
     background: var(--surface-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius-small);
-    padding: 9px 12px;
-    width: 100%;
+    padding: 0 12px;
   }
-  select:focus-visible, input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .select-field select { appearance: none; -webkit-appearance: none; padding-right: 40px; cursor: pointer; text-overflow: ellipsis; }
+  .select-field select:focus-visible, input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .select-field select:focus-visible + .select-chevron { color: var(--accent); }
+  input[type="text"]::placeholder { color: var(--text-tertiary); }
+  .field-hint { font-size: 13px; color: var(--text-secondary); margin-top: 8px; }
+  .field-hint[data-tone="error"] { color: var(--negative); }
+
+  /* ---- Buttons ------------------------------------------------------------------------------ */
   .button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    font: inherit;
+    min-height: var(--control-height);
     font-weight: 500;
     border-radius: 999px;
-    padding: 9px 18px;
+    padding: 0 18px;
     border: 1px solid transparent;
     cursor: pointer;
     white-space: nowrap;
+    transition: background-color 0.15s ease, opacity 0.15s ease;
   }
-  .button svg { width: 16px; height: 16px; }
+  .button svg { width: 17px; height: 17px; flex: none; }
   .button-primary { background: var(--accent); color: var(--accent-text); }
-  .button-primary:hover { background: var(--accent-pressed); }
+  .button-primary:hover:not(:disabled) { background: var(--accent-pressed); }
   .button-secondary { background: var(--surface-secondary); color: var(--text-primary); border-color: var(--border); }
+  .button-secondary:hover:not(:disabled) { background: var(--surface-pressed); }
   .button-destructive { background: transparent; color: var(--negative); border-color: var(--border); }
+  .button-destructive:hover:not(:disabled) { background: var(--negative-subtle); }
+  .button-destructive-filled { background: var(--negative); color: #ffffff; }
   .button:disabled { opacity: 0.45; cursor: default; }
+  .button[data-busy="true"] { opacity: 0.8; cursor: progress; }
   .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
-  .link-row { display: flex; gap: 10px; margin-top: 12px; }
-  .link-row input { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
-  .file-list { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--border); }
-  .file-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
-  .file-row svg { width: 20px; height: 20px; color: var(--text-secondary); flex: none; }
+  .link-row { display: flex; gap: 10px; margin-top: 16px; }
+  .link-row input { min-width: 0; }
+  #share-link { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+
+  /* ---- Status: icon, text, elapsed time, bar and caption ------------------------------------ */
+  .status { margin-top: 20px; }
+  .status-line { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+  .status-icon { display: inline-flex; width: 20px; height: 20px; flex: none; color: var(--accent); }
+  .status-icon svg { width: 20px; height: 20px; }
+  .status-text { flex: 1; min-width: 0; font-weight: 600; }
+  .status-elapsed { flex: none; font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .status[data-tone="positive"] .status-icon { color: var(--positive); }
+  .status[data-tone="warning"] .status-icon { color: var(--warning); }
+  .status[data-tone="error"] .status-icon { color: var(--negative); }
+  .status-caption { margin-top: 8px !important; font-size: 13px; color: var(--text-secondary); }
+  .progress-track { position: relative; height: 6px; border-radius: 999px; background: var(--progress-track); overflow: hidden; margin-top: 12px; }
+  .progress-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
+  .status[data-tone="positive"] .progress-fill { background: var(--positive); }
+  .status[data-tone="warning"] .progress-fill { background: var(--warning); }
+  /* Indeterminate: a short segment slides across while the length of the wait is unknown. */
+  .progress-track[data-mode="indeterminate"] .progress-fill { position: absolute; left: 0; width: 32%; transition: none; animation: slide 1.5s ease-in-out infinite; }
+
+  /* ---- File and recipient lists ------------------------------------------------------------- */
+  .file-list, .recipient-list { list-style: none; margin: 16px 0 0; padding: 0; border-top: 1px solid var(--separator); }
+  .file-row, .recipient-row { display: flex; align-items: center; gap: 12px; min-height: 52px; padding: 8px 0; border-bottom: 1px solid var(--separator); }
+  .file-row > svg, .recipient-row > svg { width: 20px; height: 20px; color: var(--text-secondary); flex: none; }
+  .file-text, .recipient-text { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 12px; }
   .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-  .file-size { color: var(--text-secondary); font-size: 13px; flex: none; }
+  .file-size { color: var(--text-secondary); font-size: 13px; flex: none; font-variant-numeric: tabular-nums; }
+  .file-row .button { min-height: 36px; padding: 0 14px; font-size: 14px; }
   .verified { display: inline-flex; align-items: center; gap: 4px; color: var(--positive); font-size: 13px; flex: none; }
-  .verified svg { width: 14px; height: 14px; color: var(--positive); }
-  .progress-track { height: 6px; border-radius: 999px; background: var(--progress-track); overflow: hidden; margin-top: 16px; }
-  .progress-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.3s ease; }
+  .verified[data-tone="error"] { color: var(--negative); }
+  .verified svg { width: 14px; height: 14px; }
+  .recipient-name { font-weight: 500; flex: none; }
+  .recipient-state { flex: 1; min-width: 0; color: var(--text-secondary); font-size: 13px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .recipient-row[data-state="receiving"] > svg { color: var(--accent); }
+  .recipient-row[data-state="done"] > svg, .recipient-row[data-state="done"] .recipient-state { color: var(--positive); }
+  .recipient-row[data-state="failed"] > svg, .recipient-row[data-state="failed"] .recipient-state { color: var(--negative); }
+  .recipient-row[data-state="cancelled"] .recipient-name, .recipient-row[data-state="refused"] .recipient-name { color: var(--text-secondary); }
+  .recipient-progress { height: 4px; border-radius: 999px; background: var(--progress-track); overflow: hidden; margin-top: 6px; }
+  .recipient-progress > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
+  .recipient-body { flex: 1; min-width: 0; }
+  .empty-state { display: flex; align-items: center; gap: 10px; padding: 16px 0; color: var(--text-secondary); font-size: 14px; border-bottom: 1px solid var(--separator); }
+  .empty-state svg { width: 18px; height: 18px; flex: none; }
+
+  /* ---- Stats, notices, QR ------------------------------------------------------------------- */
   .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-top: 16px; }
   .stat { background: var(--surface-secondary); border-radius: var(--radius-medium); padding: 12px; }
   .stat-label { font-size: 12px; color: var(--text-secondary); }
   .stat-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .notice { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; padding: 12px 14px; border-radius: var(--radius-medium); background: var(--surface-secondary); font-size: 13px; }
   .notice svg { width: 18px; height: 18px; flex: none; margin-top: 1px; color: var(--text-secondary); }
-  .notice[data-tone="error"] svg, .notice[data-tone="error"] { color: var(--negative); }
+  .notice[data-tone="error"] { background: var(--negative-subtle); }
+  .notice[data-tone="error"], .notice[data-tone="error"] svg { color: var(--negative); }
   .notice[data-tone="warning"] svg { color: var(--warning); }
-  .qr-image { display: block; margin: 16px auto 0; width: 200px; height: 200px; border-radius: var(--radius-small); background: #ffffff; padding: 8px; }
-  .spin { animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .progress-fill { transition: none; } }
-  .facts { margin: 16px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
-  .facts li { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text-secondary); }
+  .notice[data-tone="info"] svg { color: var(--accent); }
+  .qr-image { display: block; margin: 16px auto 0; width: 220px; height: 220px; border-radius: var(--radius-small); background: #ffffff; padding: 8px; }
+
+  /* ---- Confirmation dialog ------------------------------------------------------------------ */
+  dialog.sheet {
+    width: min(400px, calc(100vw - 32px));
+    padding: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-large);
+    background: var(--surface);
+    color: var(--text-primary);
+  }
+  dialog.sheet::backdrop { background: var(--backdrop); }
+  dialog.sheet h2 { font-size: 17px; font-weight: 600; margin: 0 0 6px; }
+  dialog.sheet p { margin: 0; color: var(--text-secondary); font-size: 14px; }
+  dialog.sheet .button-row { justify-content: flex-end; margin-top: 20px; }
+
+  /* ---- Facts and diagnostics ---------------------------------------------------------------- */
+  .facts { margin: 20px 0 0; padding: 0 4px; list-style: none; display: grid; gap: 10px; }
+  .facts li { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; color: var(--text-secondary); }
   .facts svg { width: 16px; height: 16px; flex: none; margin-top: 2px; color: var(--text-secondary); }
-  .diagnostics summary { cursor: pointer; font-weight: 600; font-size: 15px; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .diagnostics summary { cursor: pointer; font-weight: 600; font-size: 15px; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 24px; }
   .diagnostics summary::-webkit-details-marker { display: none; }
   .diagnostics summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
   .diagnostics-count { font-weight: 400; font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .diagnostics .muted.small { margin-top: 8px; }
   .log-output {
     margin: 12px 0 0;
     max-height: 360px;
@@ -199,111 +347,216 @@
   }
   .log-level-warn { color: var(--warning); }
   .log-level-error { color: var(--negative); }
+
+  /* ---- Motion ------------------------------------------------------------------------------- */
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(320%); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spin, .network-status[data-state="connecting"] .status-dot { animation: none; }
+    .progress-fill, .recipient-progress > div { transition: none; }
+    .progress-track[data-mode="indeterminate"] .progress-fill { animation: none; width: 100%; opacity: 0.35; }
+  }
+
+  /* ---- Phones ------------------------------------------------------------------------------- */
+  @media (max-width: 560px) {
+    :root { --page-padding: 16px; }
+    .app-header { padding-top: calc(14px + env(safe-area-inset-top)); }
+    .app-title { font-size: 17px; }
+    .card { padding: 20px 18px; border-radius: 16px; }
+    .card h1 { font-size: 22px; }
+    .card-nav { margin: -6px -8px 10px; }
+    .drop-zone { min-height: 168px; }
+    /* 16px text stops iOS from zooming the page when a field is tapped. */
+    .select-field select, input[type="text"], #share-link { font-size: 16px; }
+    .options-row { flex-direction: column; gap: 12px; }
+    .field { flex-basis: auto; }
+    .link-row { flex-direction: column; }
+    .button-row { flex-direction: column; }
+    .button-row .button { width: 100%; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .stats-grid .stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
+    .file-text { flex-direction: column; align-items: stretch; gap: 0; }
+    .file-name { max-width: 100%; }
+    .recipient-text { flex-wrap: wrap; gap: 2px 12px; }
+    .recipient-state { text-align: left; flex-basis: 100%; }
+    dialog.sheet .button-row { flex-direction: column-reverse; }
+  }
+  /* Narrow phones: the status keeps its coloured dot (its text stays available to screen readers). */
+  @media (max-width: 480px) {
+    .network-status { padding: 0 8px 0 12px; }
+    .network-status #network-status-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  }
+  @media (max-width: 340px) {
+    .app-title span { display: none; }
+  }
 </style>
 </head>
 <body>
 <header class="app-header">
   <div class="app-title"><i data-lucide="shield-check"></i><span>Nym Share</span></div>
-  <div class="network-status" id="network-status" data-state="connecting" role="status" aria-live="polite">
-    <span class="status-dot"></span><span id="network-status-text">Connecting to Nym</span>
+  <div class="network-control">
+    <div class="network-status" id="network-status" data-state="connecting" role="status" aria-live="polite" title="Connection to the Nym mixnet">
+      <span class="status-dot" aria-hidden="true"></span><span id="network-status-text">Connecting</span>
+    </div>
+    <div class="network-mode-field">
+      <label class="visually-hidden" for="network-mode">Network mode</label>
+      <select id="network-mode" title="Network mode">
+        <option value="balanced">Balanced</option>
+        <option value="maximum">Maximum privacy</option>
+      </select>
+      <i class="select-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
+    </div>
   </div>
 </header>
 
 <main>
-  <!-- Send: choose files -->
+  <!-- Start: send or receive -->
   <section id="view-choose">
     <div class="card">
       <h1>Send files privately</h1>
       <p class="muted">Files are encrypted in your browser and sent through the Nym mixnet. The recipient never sees your IP address, and you never see theirs.</p>
-      <div class="drop-zone" id="drop-zone" tabindex="0" role="button" aria-label="Choose files to send">
+      <div class="drop-zone" id="drop-zone" tabindex="0" role="button" aria-describedby="drop-zone-hint">
         <i data-lucide="upload"></i>
-        <strong>Drop files here</strong>
-        <span class="muted small">or click to choose</span>
+        <strong><span class="pointer-only">Drop files here</span><span class="touch-only">Choose files</span></strong>
+        <span class="muted small" id="drop-zone-hint"><span class="pointer-only">or click to choose</span><span class="touch-only">Up to 500 MB in total</span></span>
       </div>
       <input type="file" id="file-input" multiple class="hidden">
+      <p class="field-hint hidden" id="choose-error" data-tone="error" role="alert"></p>
       <div class="options-row">
         <div class="field">
-          <label for="recipient-limit">Recipients</label>
-          <select id="recipient-limit">
-            <option value="1">1 recipient</option>
-            <option value="5" selected>Up to 5</option>
-            <option value="10">Up to 10</option>
-            <option value="0">No limit</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="privacy-mode">Network mode for sending</label>
-          <select id="privacy-mode">
-            <option value="balanced" selected>Balanced, somewhat faster</option>
-            <option value="maximum">Maximum privacy, Nym defaults</option>
-          </select>
+          <label for="recipient-limit">Who can download</label>
+          <div class="select-field">
+            <select id="recipient-limit">
+              <option value="1">1 person</option>
+              <option value="5" selected>Up to 5 people</option>
+              <option value="10">Up to 10 people</option>
+              <option value="0">Anyone with the link</option>
+            </select>
+            <i class="select-chevron" data-lucide="chevron-down" aria-hidden="true"></i>
+          </div>
         </div>
       </div>
     </div>
     <div class="card">
       <h2>Receive files</h2>
-      <p class="muted small">Paste a Nym Share link you were sent.</p>
-      <form class="link-row" id="paste-form">
-        <input type="text" id="paste-input" placeholder="Paste link" autocomplete="off" spellcheck="false" aria-label="Share link">
+      <p class="muted small" style="margin-top: 4px;">Paste a Nym Share link you were sent.</p>
+      <form class="link-row" id="paste-form" novalidate>
+        <input type="text" id="paste-input" placeholder="Paste link" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-label="Share link" aria-describedby="paste-error">
         <button class="button button-secondary" type="submit"><i data-lucide="arrow-right"></i>Open</button>
       </form>
+      <p class="field-hint hidden" id="paste-error" data-tone="error" role="alert"></p>
     </div>
   </section>
 
-  <!-- Send: sharing -->
+  <!-- Send: preparing, then sharing -->
   <section id="view-share" class="hidden">
     <div class="card">
-      <h1 id="share-title">Encrypting</h1>
-      <p class="muted" id="share-subtitle">Preparing your files.</p>
-      <div class="progress-track" id="encrypt-progress-track"><div class="progress-fill" id="encrypt-progress"></div></div>
+      <h1 id="share-title">Preparing</h1>
+      <p class="muted" id="share-subtitle"></p>
+
+      <div class="status" id="share-status" data-tone="neutral">
+        <div class="status-line">
+          <span class="status-icon" id="share-status-icon"></span>
+          <span class="status-text" id="share-status-text" role="status" aria-live="polite"></span>
+          <span class="status-elapsed" id="share-status-elapsed"></span>
+        </div>
+        <div class="progress-track" id="share-status-track"><div class="progress-fill" id="share-status-fill"></div></div>
+        <p class="status-caption" id="share-status-caption"></p>
+        <div class="button-row hidden" id="share-error-actions">
+          <button class="button button-secondary" id="share-start-over" type="button"><i data-lucide="rotate-cw"></i>Start over</button>
+        </div>
+      </div>
+
       <div id="share-ready" class="hidden">
         <div class="link-row">
           <input type="text" id="share-link" readonly aria-label="Share link">
-          <button class="button button-primary" id="copy-link" type="button"><i data-lucide="copy"></i><span>Copy</span></button>
+          <button class="button button-primary" id="copy-link" type="button"><i data-lucide="copy"></i><span>Copy link</span></button>
         </div>
         <div class="button-row">
-          <button class="button button-secondary" id="toggle-qr" type="button"><i data-lucide="qr-code"></i>QR code</button>
+          <button class="button button-secondary hidden" id="native-share" type="button"><i data-lucide="share"></i>Share</button>
+          <button class="button button-secondary" id="toggle-qr" type="button" aria-expanded="false"><i data-lucide="qr-code"></i><span>Show QR code</span></button>
           <button class="button button-destructive" id="stop-sharing" type="button"><i data-lucide="circle-x"></i>Stop sharing</button>
         </div>
         <img class="qr-image hidden" id="qr-image" alt="QR code of the share link">
+
+        <div class="section">
+          <div class="section-header">
+            <h2>Recipients</h2>
+            <span class="section-meta" id="recipient-count"></span>
+          </div>
+          <div class="empty-state" id="recipient-empty"><i data-lucide="hourglass"></i><span>Nobody has opened the link yet.</span></div>
+          <ul class="recipient-list hidden" id="recipient-list" aria-live="polite"></ul>
+        </div>
+
         <div class="stats-grid">
-          <div class="stat"><div class="stat-label">Connected</div><div class="stat-value" id="stat-connected">0</div></div>
-          <div class="stat"><div class="stat-label">Finished</div><div class="stat-value" id="stat-finished">0</div></div>
           <div class="stat"><div class="stat-label">Sent</div><div class="stat-value" id="stat-sent">0 B</div></div>
           <div class="stat"><div class="stat-label">Upload</div><div class="stat-value" id="stat-upload">0 B/s</div></div>
         </div>
-        <div class="notice" data-tone="warning"><i data-lucide="triangle-alert"></i><span>Keep this tab open. Files go straight from this tab to each recipient, and nothing is stored on a server.</span></div>
+        <div class="notice" data-tone="warning"><i data-lucide="triangle-alert"></i><span>Keep this tab open. Files go straight from this tab to each recipient, and nothing is stored on a server. On a phone, switching to another app pauses sending.</span></div>
+        <div class="notice" data-tone="info"><i data-lucide="gauge"></i><span id="share-data-text"></span></div>
         <div class="notice hidden" id="share-notice" data-tone="warning" role="status"><i data-lucide="info"></i><span id="share-notice-text"></span></div>
       </div>
-      <ul class="file-list" id="share-file-list"></ul>
+
+      <div class="section">
+        <div class="section-header">
+          <h2>Files</h2>
+          <span class="section-meta" id="share-file-summary"></span>
+        </div>
+        <ul class="file-list" id="share-file-list"></ul>
+      </div>
     </div>
   </section>
 
   <!-- Receive -->
   <section id="view-receive" class="hidden">
     <div class="card">
+      <div class="card-nav">
+        <button class="nav-button" id="receive-back" type="button"><span id="receive-back-icon"><i data-lucide="chevron-left"></i></span><span id="receive-back-label">Back</span></button>
+      </div>
       <h1 id="receive-title">Files for you</h1>
-      <p class="muted" id="receive-subtitle">Checking whether the sender is online.</p>
-      <p class="muted small" id="receive-mode"></p>
-      <ul class="file-list" id="receive-file-list"></ul>
-      <div class="progress-track hidden" id="receive-progress-track"><div class="progress-fill" id="receive-progress"></div></div>
+      <p class="muted" id="receive-subtitle"></p>
+
+      <div class="status" id="receive-status" data-tone="neutral">
+        <div class="status-line">
+          <span class="status-icon" id="receive-status-icon"></span>
+          <span class="status-text" id="receive-status-text" role="status" aria-live="polite"></span>
+          <span class="status-elapsed" id="receive-status-elapsed"></span>
+        </div>
+        <div class="progress-track" id="receive-status-track"><div class="progress-fill" id="receive-status-fill"></div></div>
+        <p class="status-caption" id="receive-status-caption"></p>
+      </div>
+
       <div class="stats-grid hidden" id="receive-stats">
         <div class="stat"><div class="stat-label">Received</div><div class="stat-value" id="stat-received">0 B</div></div>
         <div class="stat"><div class="stat-label">Speed</div><div class="stat-value" id="stat-download">0 B/s</div></div>
         <div class="stat"><div class="stat-label">Time left</div><div class="stat-value" id="stat-eta">Estimating</div></div>
       </div>
+
       <div class="button-row">
-        <button class="button button-primary" id="start-download" type="button" disabled><i data-lucide="download"></i>Download</button>
-        <button class="button button-secondary hidden" id="save-all" type="button"><i data-lucide="download"></i>Save all</button>
+        <button class="button button-primary" id="start-download" type="button"><span id="start-download-icon"><i data-lucide="download"></i></span><span id="start-download-label">Download</span></button>
+        <button class="button button-primary hidden" id="try-again" type="button"><i data-lucide="rotate-cw"></i>Try again</button>
+        <button class="button button-primary hidden" id="save-all" type="button"><i data-lucide="download"></i>Save all</button>
       </div>
       <div class="notice hidden" id="receive-notice" role="status"><i data-lucide="info"></i><span id="receive-notice-text"></span></div>
+
+      <div class="section">
+        <div class="section-header">
+          <h2>Files</h2>
+          <span class="section-meta" id="receive-file-summary"></span>
+        </div>
+        <ul class="file-list" id="receive-file-list"></ul>
+      </div>
+      <p class="muted small" id="receive-mode" style="margin-top: 16px;"></p>
     </div>
   </section>
 
   <ul class="facts">
-    <li><i data-lucide="lock"></i><span>Encrypted in the browser with AES-128-GCM. The key is only in the link, after the #, which browsers never send to a server.</span></li>
+    <li><i data-lucide="lock"></i><span>Encrypted in the browser with AES-128-GCM. The key is only in the link, after the #, which browsers never send to a server. After a link is opened, this page removes the key from the address bar.</span></li>
     <li><i data-lucide="eye-off"></i><span>Every byte between sender and recipient goes through the Nym mixnet. The sender answers through single-use reply blocks and never learns the recipient's Nym address.</span></li>
-    <li><i data-lucide="gauge"></i><span>A mixnet trades speed for privacy. In testing, a 1 MB file took about 40 seconds.</span></li>
+    <li><i data-lucide="gauge"></i><span>A mixnet trades speed for privacy. Expect 15 to 25 seconds of setup before files start moving, then roughly 15 to 25 KB per second.</span></li>
+    <li><i data-lucide="shield-check"></i><span>Network mode, at the top: Balanced sends more steady cover traffic and is somewhat faster, using about 2 GB of data an hour while connected. Maximum privacy uses Nym's default settings and about 0.8 GB an hour. The page disconnects after 5 minutes without activity.</span></li>
   </ul>
 
   <!-- Diagnostics: a session log for testing. It never contains keys, links, file names or full Nym addresses. -->
@@ -318,6 +571,17 @@
     <div class="log-output" id="log-output" role="log" aria-live="off"></div>
   </details>
 </main>
+
+<dialog class="sheet" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-message"></p>
+    <div class="button-row">
+      <button class="button button-secondary" id="confirm-cancel" value="cancel" type="submit"></button>
+      <button class="button button-destructive-filled" id="confirm-accept" value="accept" type="submit"></button>
+    </div>
+  </form>
+</dialog>
 
 <!-- APP_SCRIPT -->
 </body>

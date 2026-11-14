@@ -12,7 +12,7 @@ End-to-end encrypted file sharing in the browser, where neither side learns the 
 
 The sender's browser encrypts each file with [wormhole-crypto](https://github.com/SocketDev/wormhole-crypto) (RFC 8188, AES-128-GCM) and shares the encrypted files as a private WebTorrent swarm. Every byte between sender and recipient travels through the [Nym mixnet](https://nym.com) as client-to-client messages, so the two browsers never connect to each other directly.
 
-The share link carries everything a recipient needs after the `#`: the sender's Nym address, the torrent's infohash, the decryption key and an encrypted list of file names, sizes and SHA-256 checksums. Browsers never send the part after `#` to any server. Each received file is decrypted and checked against its checksum before it can be saved.
+The share link carries everything a recipient needs after the `#`: the sender's Nym address, the torrent's infohash, the decryption key and an encrypted list of file names, sizes and SHA-256 checksums. Browsers never send the part after `#` to any server. As soon as a link is opened, the page replaces it in the address bar and the session history with the bare page address, so the key does not stay there. Each received file is decrypted and checked against its checksum before it can be saved.
 
 ## What is and is not protected
 
@@ -20,11 +20,25 @@ The share link carries everything a recipient needs after the `#`: the sender's 
 - Neither side learns the other's IP address. Each side's Nym entry node (gateway) sees that side's IP, but not who it is talking to.
 - The sender never learns the recipient's Nym address. The recipient attaches single-use reply blocks to its messages, and the sender answers only through those. The recipient does learn the sender's Nym address, from the link.
 - The sender's tab has to stay open until recipients finish. There is no cloud copy.
-- Throughput through the mixnet is low. In testing, a 1 MB file took about 40 seconds.
+- Throughput through the mixnet is low. In testing, a transfer spent 15 to 25 seconds on setup, then moved roughly 15 to 25 KB per second.
 
 ## Using it
 
-Open the page, drop in files and send the link. The recipient opens the link, or pastes it into the Receive box, and clicks Download. The Diagnostics panel at the bottom keeps a timestamped log that never contains keys, links, file names or full Nym addresses.
+Open the page, drop in files and send the link. The recipient opens the link, or pastes it into the Receive box, and clicks Download; pressing Download before the sender has answered starts the download as soon as it does. The sender sees each recipient in a list, numbered in the order they made contact, with their progress. The Diagnostics panel at the bottom keeps a timestamped log that never contains keys, links, file names or full Nym addresses.
+
+### Network mode
+
+The mode menu at the top applies to the whole page and is remembered in the browser. Balanced asks the Nym client for a packet every 2 ms instead of Nym's default 20 ms; browsers deliver about 135 packets a second (about 2.65 Mbps up), against 55 (about 1.1 Mbps) for Maximum privacy, which uses Nym's defaults. The two sides do not need the same mode: each mode only shapes that side's own traffic. Changing the mode while a client is still connecting cancels it at once instead of waiting for it to finish.
+
+### Data use
+
+A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 2 GB in Balanced, even with nothing to send, because the Nym client keeps a steady stream of cover traffic. The share view shows the rate measured on its own connection. With nothing in progress (the start page, or a finished or failed download), the page disconnects after 5 minutes without activity and reconnects on the next click, key press or return to the tab.
+
+### Stopping and cancelling
+
+- Stop sharing asks first, then tells every recipient who has not finished that sharing stopped, through the reply blocks they sent. A recipient who opens the link later is told the same.
+- A recipient can go back before downloading, cancel during a download (it asks first and tells the sender, which frees the place under the recipient limit), or press Done afterwards (it asks first if files are not saved yet). The browser's Back button does the same as the on-page button.
+- A recipient stops asking an unresponsive sender after 3 minutes before the download, or after 5 minutes of a stalled download, and offers Try again. Pieces already received are kept.
 
 ## Reliability
 

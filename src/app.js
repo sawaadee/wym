@@ -17,6 +17,11 @@ import {
   createIcons,
   ArrowRight as ArrowRightIcon,
   Check as CheckIcon,
+  ChevronDown as ChevronDownIcon,
+  ChevronLeft as ChevronLeftIcon,
+  CircleAlert as CircleAlertIcon,
+  CircleCheck as CircleCheckIcon,
+  CircleSlash as CircleSlashIcon,
   CircleX as CircleXIcon,
   ClipboardCopy as ClipboardCopyIcon,
   Copy as CopyIcon,
@@ -26,12 +31,17 @@ import {
   File as FileIcon,
   FileDown as FileDownIcon,
   Gauge as GaugeIcon,
+  Hourglass as HourglassIcon,
   Info as InfoIcon,
+  LoaderCircle as LoaderCircleIcon,
   Lock as LockIcon,
   QrCode as QrCodeIcon,
+  RotateCw as RotateCwIcon,
+  Share as ShareIcon,
   ShieldCheck as ShieldCheckIcon,
   TriangleAlert as TriangleAlertIcon,
-  Upload as UploadIcon
+  Upload as UploadIcon,
+  UserRound as UserRoundIcon
 } from 'lucide'
 
 // PAGE_VERSION is replaced at build time with the version in package.json.
@@ -100,6 +110,23 @@ const SLOW_CONTROL_MESSAGE_MS = 10000
 const LINK_VERSION = 'v2'
 const LINK_MODE_CODES = { balanced: 'b', maximum: 'm' }
 const MODE_LABELS = { balanced: 'Balanced', maximum: 'Maximum privacy' }
+// The network mode is a page-wide setting, remembered in this browser so the next visit starts
+// in it and never connects in one mode only to restart in another.
+const MODE_STORAGE_KEY = 'nym-share-network-mode'
+const DEFAULT_MODE = 'balanced'
+// Data used per hour while connected, upload plus download, from gateway traffic measured in
+// Brave and Chromium on macOS (0.5.1): Maximum 1.1 + 0.7 Mbps, Balanced 2.65 + 1.8 Mbps. The share
+// view shows these until this tab has measured its own rate.
+const ESTIMATED_GIGABYTES_PER_HOUR = { balanced: 2.0, maximum: 0.8 }
+// With nothing to send or receive, the page disconnects from Nym after this long without user
+// activity, and reconnects on the next click, key press or return to the tab.
+const NYM_IDLE_DISCONNECT_MS = 5 * 60 * 1000
+// A recipient stops asking an unresponsive sender after RECEIVER_GIVE_UP_MS before the download,
+// or after RECEIVER_STALL_GIVE_UP_MS of a stalled download, and offers Try again instead.
+const RECEIVER_GIVE_UP_MS = 3 * 60 * 1000
+const RECEIVER_STALL_GIVE_UP_MS = 5 * 60 * 1000
+// How long Stop sharing waits for its "stopped" messages to be handed to the Nym client.
+const STOP_NOTICE_WAIT_MS = 3000
 const LINK_SEPARATOR = '~' // Nym addresses contain "." and "@", never "~"
 
 // ---------------------------------------------------------------------------
@@ -320,6 +347,11 @@ function loadLibraries () {
 const PAGE_ICONS = {
   ArrowRight: ArrowRightIcon,
   Check: CheckIcon,
+  ChevronDown: ChevronDownIcon,
+  ChevronLeft: ChevronLeftIcon,
+  CircleAlert: CircleAlertIcon,
+  CircleCheck: CircleCheckIcon,
+  CircleSlash: CircleSlashIcon,
   CircleX: CircleXIcon,
   ClipboardCopy: ClipboardCopyIcon,
   Copy: CopyIcon,
@@ -329,12 +361,17 @@ const PAGE_ICONS = {
   File: FileIcon,
   FileDown: FileDownIcon,
   Gauge: GaugeIcon,
+  Hourglass: HourglassIcon,
   Info: InfoIcon,
+  LoaderCircle: LoaderCircleIcon,
   Lock: LockIcon,
   QrCode: QrCodeIcon,
+  RotateCw: RotateCwIcon,
+  Share: ShareIcon,
   ShieldCheck: ShieldCheckIcon,
   TriangleAlert: TriangleAlertIcon,
-  Upload: UploadIcon
+  Upload: UploadIcon,
+  UserRound: UserRoundIcon
 }
 function renderIcons () {
   try {
@@ -347,10 +384,21 @@ function renderIcons () {
 // ---------------------------------------------------------------------------
 // Network status
 // ---------------------------------------------------------------------------
-function setNetworkStatus (state, text) {
+// The header pill shows one of these states. "paused" means the page disconnected on purpose
+// after NYM_IDLE_DISCONNECT_MS without activity, to save data; it reconnects on the next action.
+const NETWORK_STATUS_TEXT = {
+  connecting: { text: 'Connecting', title: 'Joining the Nym mixnet.' },
+  reconnecting: { text: 'Reconnecting', title: 'The connection to the Nym mixnet dropped. Reconnecting.' },
+  connected: { text: 'Connected', title: 'Connected to the Nym mixnet.' },
+  paused: { text: 'Paused', title: 'Disconnected after 5 minutes without activity, to save data. It reconnects when you use the page.' },
+  failed: { text: 'Offline', title: 'Could not reach the Nym mixnet.' }
+}
+function setNetworkStatus (state) {
+  const description = NETWORK_STATUS_TEXT[state] ?? NETWORK_STATUS_TEXT.connecting
   const pill = elementById('network-status')
-  pill.dataset.state = state
-  elementById('network-status-text').textContent = text
+  pill.dataset.state = state === 'reconnecting' ? 'connecting' : state
+  pill.title = description.title
+  elementById('network-status-text').textContent = description.text
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +540,7 @@ async function removeStaleNymStorage (currentClientId) {
 // The keys and gateway registration stored under that id are reused, so the address in an
 // existing share link stays valid and messages the gateway held meanwhile are delivered.
 // Sends made while the client is being replaced wait for it (up to NYM_SEND_WAIT_MS).
-async function createNymNode (mode) {
+async function createNymNode (mode, abortSignal) {
   const startedAt = performance.now()
   const clientId = NYM_CLIENT_ID_PREFIX + crypto.randomUUID()
   const stopHeartbeat = startClientHeartbeat(clientId)
@@ -512,6 +560,8 @@ async function createNymNode (mode) {
     onReconnected: null,
     counters: { dataFramesIn: 0, dataBytesIn: 0, dataFramesOut: 0, dataBytesOut: 0, controlIn: 0, controlOut: 0, sendFailures: 0, unknownMessages: 0, gatewayDisconnects: 0, reconnects: 0, faultDroppedFrames: 0 }
   }
+  // Only the page's current node drives the header status; a node being replaced stays quiet.
+  const reportNetworkStatus = state => { if (currentNymNode === node) setNetworkStatus(state) }
   let mixnetClient = null
   let clientGeneration = 0
   let usableWaiters = []
@@ -552,6 +602,15 @@ async function createNymNode (mode) {
       tabHiddenSamples: totals.hiddenSamples,
       samples: totals.samples
     }
+  }
+  // Combined upload and download rate measured so far, in megabits per second, or null before
+  // the first 10 s sample. The share view turns it into data per hour.
+  node.measuredMegabitsPerSecond = () => {
+    const idle = gatewayTrafficTotals.idle
+    const busy = gatewayTrafficTotals.busy
+    const seconds = (idle.milliseconds + busy.milliseconds) / 1000
+    if (seconds <= 0) return null
+    return (idle.bytesOut + idle.bytesIn + busy.bytesOut + busy.bytesIn) * 8 / seconds / 1e6
   }
   node.describeGatewayTraffic = () => ({
     mode,
@@ -691,7 +750,7 @@ async function createNymNode (mode) {
         clearTimeout(socketGraceTimer)
         socketGraceTimer = null
         diagnostics.info('nym', 'gateway connection restored by the Nym client', { afterMs: Math.round(performance.now() - socketLostAt) })
-        setNetworkStatus('connected', 'Connected to Nym')
+        reportNetworkStatus('connected')
       }
       return
     }
@@ -706,7 +765,7 @@ async function createNymNode (mode) {
     node.counters.gatewayDisconnects += 1
     socketLostAt = performance.now()
     diagnostics.warn('nym', 'gateway connection lost', { code, wasClean, waitingMs: NYM_INTERNAL_RECONNECT_GRACE_MS })
-    setNetworkStatus('connecting', 'Reconnecting to Nym')
+    reportNetworkStatus('reconnecting')
     socketGraceTimer = setTimeout(() => {
       socketGraceTimer = null
       node.reconnect('the gateway connection did not come back within ' + NYM_INTERNAL_RECONNECT_GRACE_MS / 1000 + ' s')
@@ -721,6 +780,7 @@ async function createNymNode (mode) {
   // Starts a Nym client under this node's clientId and waits for its gateway connection.
   // Events from a client that has since been replaced are ignored.
   const startClient = async (purpose, preferredGateway) => {
+    if (abortSignal?.aborted) throw createAbortError()
     const generation = ++clientGeneration
     const attemptStartedAt = performance.now()
     const { createNymMixnetClient } = await loadLibraries()
@@ -743,12 +803,17 @@ async function createNymNode (mode) {
     const hardDeadline = attemptStartedWall + NYM_CONNECT_ATTEMPT_MAX_MS
     const currentDeadline = () => Math.min(hardDeadline, Math.max(attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS, lastSocketActivityAt + NYM_CONNECT_ACTIVITY_GRACE_MS))
     let extensionLogged = false
-    while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration) {
+    while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration && !abortSignal?.aborted) {
       if (!extensionLogged && Date.now() > attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS) {
         extensionLogged = true
         diagnostics.info('nym', 'still connecting; the gateway connection is active, so waiting longer', { purpose, waitedMs: Date.now() - attemptStartedWall })
       }
       await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    if (abortSignal?.aborted && !connectedAddress) {
+      // The page asked for another mode or went idle while this client was still connecting.
+      await shutDownClient(candidate, purpose)
+      throw createAbortError()
     }
     if (generation !== clientGeneration || node.state === 'stopped') {
       // The node was stopped while this client was connecting; do not leave it running.
@@ -769,6 +834,7 @@ async function createNymNode (mode) {
     node.address = address
   } catch (error) {
     // A first attempt that never connected leaves nothing worth keeping.
+    clearInterval(gatewayTrafficTimer)
     stopHeartbeat()
     indexedDB.deleteDatabase(NYM_STORAGE_PREFIX + clientId)
     throw error
@@ -783,7 +849,7 @@ async function createNymNode (mode) {
     reconnectPromise = (async () => {
       const reconnectStartedAt = performance.now()
       setState('reconnecting')
-      setNetworkStatus('connecting', 'Reconnecting to Nym')
+      reportNetworkStatus('reconnecting')
       diagnostics.warn('nym', 'replacing the Nym client with the same identity', { reason })
       const previousClient = mixnetClient
       mixnetClient = null
@@ -803,13 +869,13 @@ async function createNymNode (mode) {
             node.address = address
           }
           setState('connected')
-          setNetworkStatus('connected', 'Connected to Nym')
+          reportNetworkStatus('connected')
           try { node.onReconnected?.({ sameAddress }) } catch (error) { diagnostics.error('nym', 'reconnect handler failed', error) }
           return true
         } catch (error) {
           const delayMs = Math.min(NYM_RECONNECT_MAX_DELAY_MS, 2000 * 2 ** (attempt - 1))
           diagnostics.warn('nym', 'reconnect attempt ' + attempt + ' failed; next try in ' + delayMs / 1000 + ' s', error)
-          setNetworkStatus('failed', 'Nym unavailable, retrying')
+          reportNetworkStatus('failed')
           await new Promise(resolve => setTimeout(resolve, delayMs))
         }
       }
@@ -880,18 +946,31 @@ async function createNymNode (mode) {
 }
 
 // One Nym client per page, started early so connecting overlaps with choosing files.
-// getNymNode(mode) always resolves to a client running in that mode. Asking for a different
-// mode chains a switch onto the current client: the switch waits for it to finish connecting,
-// stops it, then starts the new one. Because each switch is chained to the previous promise,
-// switching again while one is in progress can never stop the same client twice or leave
-// two clients running.
+// getNymNode(mode) always resolves to a client running in that mode. Asking for a different mode
+// cancels a client that is still connecting at once (its abort signal ends the connect wait) and
+// stops one that already connected, then starts the new one. Each switch is chained to the
+// previous promise, so switching repeatedly can never stop the same client twice or leave two
+// clients running. stopNymNode() disconnects without starting another (idle disconnect).
 let nymNodePromise = null
 let nymNodeMode = null
+let nymNodeAbortController = null
+let currentNymNode = null
+
+function createAbortError () {
+  const error = new Error('Connecting was cancelled.')
+  error.name = 'AbortError'
+  return error
+}
+
 function getNymNode (mode) {
   if (nymNodePromise && nymNodeMode === mode) return nymNodePromise
   const previousPromise = nymNodePromise
+  nymNodeAbortController?.abort()
+  const abortController = new AbortController()
+  nymNodeAbortController = abortController
   nymNodeMode = mode
-  setNetworkStatus('connecting', 'Connecting to Nym')
+  currentNymNode = null
+  setNetworkStatus('connecting')
   const promise = (async () => {
     if (previousPromise) {
       const previous = await previousPromise.catch(() => null)
@@ -904,25 +983,55 @@ function getNymNode (mode) {
     // mode switch never connected at all, while the next fresh client connected in 5 s, so
     // a stalled attempt is abandoned and retried with a new client instead of waiting.
     for (let attempt = 1; ; attempt += 1) {
+      if (abortController.signal.aborted) throw createAbortError()
       try {
-        return await createNymNode(mode)
+        return await createNymNode(mode, abortController.signal)
       } catch (error) {
-        if (attempt >= NYM_CONNECT_ATTEMPTS) throw error
+        if (error?.name === 'AbortError' || attempt >= NYM_CONNECT_ATTEMPTS) throw error
         diagnostics.warn('nym', 'connection attempt ' + attempt + ' of ' + NYM_CONNECT_ATTEMPTS + ' failed; retrying', error)
       }
     }
   })().then(node => {
-    if (nymNodePromise === promise) setNetworkStatus('connected', 'Connected to Nym')
+    attachNodeDispatch(node)
+    if (nymNodePromise === promise) {
+      currentNymNode = node
+      setNetworkStatus('connected')
+    }
     return node
   }, error => {
+    if (error?.name === 'AbortError') diagnostics.info('nym', 'connecting cancelled', { mode })
     if (nymNodePromise === promise) {
-      setNetworkStatus('failed', 'Nym unavailable')
+      setNetworkStatus(error?.name === 'AbortError' ? 'paused' : 'failed')
       nymNodePromise = null
       nymNodeMode = null
     }
     throw error
   })
   nymNodePromise = promise
+  return promise
+}
+
+/** Disconnects the page's Nym client without starting another one. */
+async function stopNymNode (reason) {
+  const promise = nymNodePromise
+  if (!promise) return
+  nymNodeAbortController?.abort()
+  nymNodePromise = null
+  nymNodeMode = null
+  nymNodeAbortController = null
+  currentNymNode = null
+  diagnostics.info('nym', 'disconnecting', { reason })
+  setNetworkStatus('paused')
+  const node = await promise.catch(() => null)
+  if (node) await node.stop()
+}
+
+/** Connects in the selected mode unless a client is already running or connecting. */
+function ensureNymConnected (reason) {
+  if (nymNodePromise) return nymNodePromise
+  diagnostics.info('nym', 'connecting', { reason, mode: currentMode() })
+  const promise = getNymNode(currentMode())
+  promise.catch(error => { if (error?.name !== 'AbortError') diagnostics.error('nym', 'connection failed', error) })
   return promise
 }
 
@@ -1162,7 +1271,11 @@ document.addEventListener('visibilitychange', () => {
 // recipients: recipient id -> { linkIds }. The id is a random value each recipient chooses for its
 // session and only shares with this sender, so a recipient that reconnects keeps its slot under
 // the recipient limit. Like the link itself, it identifies a session, not a person.
-const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null, linkFields: null }
+// recipientViews: recipient id -> what the sender's Recipients list shows for it (a number,
+// state, latest reply tag and bytes sent over retired links). stoppedShareInfoHashes: shares this
+// page stopped; a recipient still asking about one is told it stopped.
+const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null, linkFields: null, recipientViews: new Map(), recipientRows: new Map(), nextRecipientNumber: 1, preparing: false, mode: null }
+const stoppedShareInfoHashes = new Set()
 const FRAMES_AWAITING_LINK_TTL_MS = 60000
 
 function routeSenderFrame (frame, senderTag) {
@@ -1195,22 +1308,195 @@ function routeSenderFrame (frame, senderTag) {
   sendSession.framesAwaitingLink.set(linkIdHex, entry)
 }
 
+// ---------------------------------------------------------------------------
+// Interface helpers: views, status blocks, buttons, dialogs, network mode
+// ---------------------------------------------------------------------------
+const VIEW_IDS = ['view-choose', 'view-share', 'view-receive']
+function currentView () {
+  return VIEW_IDS.find(id => !elementById(id).classList.contains('hidden'))
+}
 function showView (viewId) {
-  for (const id of ['view-choose', 'view-share', 'view-receive']) elementById(id).classList.toggle('hidden', id !== viewId)
+  const changed = currentView() !== viewId
+  for (const id of VIEW_IDS) elementById(id).classList.toggle('hidden', id !== viewId)
+  updateModeControl()
+  updateDocumentTitle()
+  if (changed) window.scrollTo({ top: 0 })
 }
 
+/** Replaces a container's icon. className is added to the generated svg (for example "spin"). */
+function setIcon (container, iconName, className) {
+  const attributes = { 'data-lucide': iconName }
+  if (className) attributes.class = className
+  container.replaceChildren(createElement('i', attributes))
+  renderIcons()
+}
+
+/** Sets a button's icon and label, skipping the work when nothing changed. */
+function setButtonContent (button, iconName, label) {
+  const key = iconName + '|' + label
+  if (button.dataset.contentKey === key) return
+  button.dataset.contentKey = key
+  const children = []
+  if (iconName) children.push(createElement('i', iconName === 'loader-circle' ? { 'data-lucide': iconName, class: 'spin' } : { 'data-lucide': iconName }))
+  children.push(createElement('span', { text: label }))
+  button.replaceChildren(...children)
+  renderIcons()
+}
+
+function formatElapsed (seconds) {
+  const whole = Math.max(0, Math.floor(seconds))
+  if (whole < 60) return whole + ' s'
+  return Math.floor(whole / 60) + ' min ' + (whole % 60) + ' s'
+}
+
+/**
+ * Renders a status block (share-status or receive-status): an icon, one line of text, the time
+ * spent in the current stage, a bar and a caption. progress is a number from 0 to 1 for a
+ * determinate bar, 'indeterminate' while the length of a wait is unknown, or null for no bar.
+ */
+function renderStatus (prefix, { tone = 'neutral', icon, spin = false, text, caption = '', progress = null, startedAt = null }) {
+  const block = elementById(prefix + '-status')
+  block.dataset.tone = tone
+  const iconContainer = elementById(prefix + '-status-icon')
+  const iconKey = icon + (spin ? ' spin' : '')
+  if (iconContainer.dataset.icon !== iconKey) {
+    iconContainer.dataset.icon = iconKey
+    setIcon(iconContainer, icon, spin ? 'spin' : null)
+  }
+  elementById(prefix + '-status-text').textContent = text
+  const captionElement = elementById(prefix + '-status-caption')
+  captionElement.textContent = caption
+  captionElement.classList.toggle('hidden', !caption)
+  const track = elementById(prefix + '-status-track')
+  const fill = elementById(prefix + '-status-fill')
+  track.classList.toggle('hidden', progress === null)
+  if (progress === 'indeterminate') {
+    track.dataset.mode = 'indeterminate'
+    fill.style.width = ''
+  } else if (typeof progress === 'number') {
+    delete track.dataset.mode
+    fill.style.width = (Math.min(1, Math.max(0, progress)) * 100).toFixed(1) + '%'
+  }
+  block.dataset.startedAt = startedAt === null ? '' : String(startedAt)
+  renderElapsed(prefix)
+}
+function renderElapsed (prefix) {
+  const startedAt = Number(elementById(prefix + '-status').dataset.startedAt)
+  elementById(prefix + '-status-elapsed').textContent = startedAt ? formatElapsed((performance.now() - startedAt) / 1000) : ''
+}
+
+/**
+ * Asks the person to confirm an action in a modal sheet. Resolves true only for the confirm
+ * button; Escape, the backdrop and the cancel button all resolve false. Focus starts on the
+ * cancel button, so pressing Enter by reflex never confirms a destructive action.
+ */
+function confirmAction ({ title, message, confirmLabel, cancelLabel }) {
+  const dialog = elementById('confirm-dialog')
+  if (typeof dialog.showModal !== 'function') return Promise.resolve(window.confirm(title + '\n\n' + message))
+  if (dialog.open) return Promise.resolve(false)
+  elementById('confirm-title').textContent = title
+  elementById('confirm-message').textContent = message
+  elementById('confirm-accept').textContent = confirmLabel
+  elementById('confirm-cancel').textContent = cancelLabel
+  dialog.returnValue = ''
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'accept'), { once: true })
+    dialog.showModal()
+    elementById('confirm-cancel').focus()
+  })
+}
+
+function showChooseError (text) {
+  const element = elementById('choose-error')
+  element.textContent = text
+  element.classList.toggle('hidden', !text)
+}
+function showPasteError (text) {
+  const element = elementById('paste-error')
+  element.textContent = text
+  element.classList.toggle('hidden', !text)
+  elementById('paste-input').setAttribute('aria-invalid', text ? 'true' : 'false')
+}
+
+function describeFileTotals (files) {
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+  return (files.length === 1 ? '1 file, ' : files.length + ' files, ') + formatBytes(totalBytes)
+}
+
+// Network mode: a page-wide setting in the header. It can only change on the start page, because
+// changing it replaces the Nym client, which would end a share or a download in progress.
+function readStoredMode () {
+  try {
+    const stored = localStorage.getItem(MODE_STORAGE_KEY)
+    return stored && Object.hasOwn(MODE_LABELS, stored) ? stored : DEFAULT_MODE
+  } catch (error) {
+    return DEFAULT_MODE
+  }
+}
+function storeMode (mode) {
+  try {
+    localStorage.setItem(MODE_STORAGE_KEY, mode)
+  } catch (error) {
+    diagnostics.warn('env', 'could not remember the network mode', error)
+  }
+}
+function currentMode () {
+  return elementById('network-mode').value
+}
+// A native dropdown is as wide as its longest option. Sizing the header's mode menu to the option
+// shown keeps the pill tight, with the chevron right after the text, and keeps it on one line on
+// narrow phones.
+let selectMeasureCanvas = null
+function fitSelectToSelection (select) {
+  const style = getComputedStyle(select)
+  selectMeasureCanvas = selectMeasureCanvas ?? document.createElement('canvas')
+  const context = selectMeasureCanvas.getContext('2d')
+  context.font = style.fontWeight + ' ' + style.fontSize + ' ' + style.fontFamily
+  const textWidth = context.measureText(select.options[select.selectedIndex]?.text ?? '').width
+  select.style.width = Math.ceil(textWidth + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 2) + 'px'
+}
+function updateModeControl () {
+  const select = elementById('network-mode')
+  const locked = currentView() !== 'view-choose'
+  select.disabled = locked
+  select.title = locked ? 'Network mode. Return to the start page to change it.' : 'Network mode'
+}
+
+/** Puts the transfer state in the tab title, so it can be followed from another tab. */
+function updateDocumentTitle () {
+  let status = ''
+  const view = currentView()
+  if (view === 'view-receive') {
+    if (receiveSession.downloading && receiveSession.torrent) status = Math.floor(receiveSession.torrent.progress * 100) + '%'
+    else if (receiveSession.stage === 'done') status = 'Ready to save'
+  } else if (view === 'view-share' && sendSession.torrent) {
+    const states = [...sendSession.recipientViews.values()].map(recipientView => recipientView.state)
+    const receiving = states.filter(state => state === 'receiving').length
+    const done = states.filter(state => state === 'done').length
+    status = receiving ? 'Sending to ' + receiving : done ? done + ' done' : 'Sharing'
+  }
+  document.title = status ? '(' + status + ') Nym Share' : 'Nym Share'
+}
+
+// Files in a list: name and size, then a Verified mark and a Save button once received.
 function renderFileRows (listElement, files, options = {}) {
   listElement.replaceChildren(...files.map((file, index) => {
     const children = [
       createElement('i', { 'data-lucide': 'file' }),
-      createElement('span', { className: 'file-name', text: file.name, title: file.name }),
-      createElement('span', { className: 'file-size', text: formatBytes(file.size) })
+      createElement('div', { className: 'file-text' }, [
+        createElement('span', { className: 'file-name', text: file.name, title: file.name }),
+        createElement('span', { className: 'file-size', text: formatBytes(file.size) })
+      ])
     ]
-    if (options.verified?.[index]) {
-      children.push(createElement('span', { className: 'verified' }, [createElement('i', { 'data-lucide': 'check' }), 'Verified']))
-    }
+    const verified = options.verified?.[index]
+    if (verified === true) children.push(createElement('span', { className: 'verified' }, [createElement('i', { 'data-lucide': 'check' }), 'Verified']))
+    if (verified === false) children.push(createElement('span', { className: 'verified', 'data-tone': 'error' }, [createElement('i', { 'data-lucide': 'circle-alert' }), 'Failed check']))
     if (options.onSave) {
-      const saveButton = createElement('button', { className: 'button button-secondary', type: 'button', 'aria-label': 'Save ' + file.name }, [createElement('i', { 'data-lucide': 'download' }), 'Save'])
+      const saved = options.saved?.has(index)
+      const saveButton = createElement('button', { className: 'button button-secondary', type: 'button', 'aria-label': (saved ? 'Save again: ' : 'Save ') + file.name }, [
+        createElement('i', { 'data-lucide': saved ? 'check' : 'download' }),
+        saved ? 'Saved' : 'Save'
+      ])
       saveButton.addEventListener('click', () => options.onSave(index))
       children.push(saveButton)
     }
@@ -1219,22 +1505,80 @@ function renderFileRows (listElement, files, options = {}) {
   renderIcons()
 }
 
+// ---------------------------------------------------------------------------
+// Message routing: one Nym client serves whichever share or download is active
+// ---------------------------------------------------------------------------
+function attachNodeDispatch (node) {
+  node.onControl = (message, senderTag) => dispatchControlMessage(node, message, senderTag)
+  node.onData = (frame, senderTag) => dispatchDataFrame(frame, senderTag)
+  node.onReconnected = ({ sameAddress }) => { if (sendSession.node === node) handleSenderReconnected(sameAddress) }
+}
+
+function dispatchControlMessage (node, message, senderTag) {
+  const infoHash = message?.infoHash
+  if (sendSession.torrent && infoHash === sendSession.torrent.infoHash) {
+    handleSenderControl(message, senderTag)
+    return
+  }
+  if (receiveSession.link && infoHash === receiveSession.link.infoHash) {
+    handleReceiverControl(message)
+    return
+  }
+  // A recipient of a share this page stopped: tell it, so it does not wait for an answer.
+  if (senderTag && stoppedShareInfoHashes.has(infoHash) && (message.kind === 'hello' || message.kind === 'open')) {
+    diagnostics.info('send', 'told a recipient that the share was stopped', describeControlMessage(message))
+    node.replyControl({ kind: 'stopped', infoHash }, senderTag).catch(() => {})
+    return
+  }
+  diagnostics.warn('nym', 'control message for no active share ignored', describeControlMessage(message))
+}
+
+let framesWithoutSession = 0
+function dispatchDataFrame (frame, senderTag) {
+  if (sendSession.torrent) {
+    routeSenderFrame(frame, senderTag)
+    return
+  }
+  if (receiveSession.link) {
+    routeReceiverFrame(frame)
+    return
+  }
+  // Late frames of a share or download that already ended.
+  framesWithoutSession += 1
+  if (framesWithoutSession === 1 || framesWithoutSession % 100 === 0) diagnostics.info('link', 'data frames after the transfer ended dropped', { frames: framesWithoutSession })
+}
+
+// ---------------------------------------------------------------------------
+// Sender: preparing, sharing, recipients, stopping
+// ---------------------------------------------------------------------------
 async function startSharing (fileList) {
-  const files = Array.from(fileList).filter(file => file.size > 0)
-  if (files.length === 0) return
+  const chosen = Array.from(fileList ?? [])
+  elementById('file-input').value = ''
+  if (sendSession.torrent || sendSession.preparing || chosen.length === 0) return
+  const files = chosen.filter(file => file.size > 0)
+  if (files.length === 0) {
+    showChooseError(chosen.length === 1 ? 'That file is empty, so there is nothing to send.' : 'Those files are empty, so there is nothing to send.')
+    return
+  }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
   if (totalBytes > MAX_TOTAL_BYTES) {
     showChooseError('These files total ' + formatBytes(totalBytes) + '. The limit is ' + formatBytes(MAX_TOTAL_BYTES) + ', because everything is held in memory.')
     return
   }
+  showChooseError(files.length < chosen.length ? 'Empty files were left out.' : '')
 
+  sendSession.preparing = true
   sendSession.recipientLimit = Number(elementById('recipient-limit').value)
-  const mode = elementById('privacy-mode').value
+  const mode = currentMode()
   const shareStartedAt = performance.now()
   diagnostics.info('send', 'sharing started', { files: files.length, plaintextBytes: totalBytes, fileSizes: files.map(file => file.size), recipientLimit: sendSession.recipientLimit || 'none', mode })
+  resetShareView()
   showView('view-share')
   renderFileRows(elementById('share-file-list'), files)
-  setShareHeading('Encrypting', 'Encrypting ' + files.length + (files.length === 1 ? ' file' : ' files') + ' in your browser.')
+  elementById('share-file-summary').textContent = describeFileTotals(files)
+  setShareHeading('Preparing your link', 'Files are encrypted here, in this tab, before anything leaves it.')
+  const encryptCaption = 'Encrypting ' + (files.length === 1 ? 'the file' : 'all ' + files.length + ' files') + ' in your browser.'
+  renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Encrypting', caption: encryptCaption, progress: 0, startedAt: shareStartedAt })
 
   try {
     const nodePromise = getNymNode(mode)
@@ -1254,12 +1598,14 @@ async function startSharing (fileList) {
       encryptedFiles.push(new File([ciphertext], 'item-' + String(index).padStart(4, '0')))
       fileDescriptions.push({ name: file.name, type: file.type, size: file.size, sha256: plaintextHash })
       processedBytes += file.size
-      elementById('encrypt-progress').style.width = Math.round((processedBytes / totalBytes) * 100) + '%'
+      renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Encrypting', caption: encryptCaption, progress: processedBytes / totalBytes, startedAt: shareStartedAt })
     }
     const encryptedList = await keychain.encryptMeta(textEncoder.encode(JSON.stringify(fileDescriptions)))
     diagnostics.info('send', 'encrypted', { ms: Math.round(performance.now() - shareStartedAt), encryptedBytes: encryptedFiles.reduce((sum, file) => sum + file.size, 0), encryptedListBytes: encryptedList.length, plaintextHashPrefixes: fileDescriptions.map(description => description.sha256.slice(0, 8)) })
 
-    setShareHeading('Connecting', 'Joining the Nym network.')
+    if (!currentNymNode || currentNymNode.mode !== mode) {
+      renderStatus('share', { icon: 'loader-circle', spin: true, text: 'Connecting to Nym', caption: 'Joining the mixnet. This usually takes 5 to 10 seconds.', progress: 'indeterminate', startedAt: performance.now() })
+    }
     sendSession.node = await nodePromise
     sendSession.mode = mode
 
@@ -1289,34 +1635,36 @@ async function startSharing (fileList) {
       encryptedListB64Url: bytesToBase64Url(encryptedList)
     }
     const shareLink = buildShareLink(sendSession.linkFields)
-
-    sendSession.node.onControl = (message, senderTag) => handleSenderControl(message, senderTag)
-    sendSession.node.onData = (frame, senderTag) => routeSenderFrame(frame, senderTag)
-    sendSession.node.onReconnected = ({ sameAddress }) => handleSenderReconnected(sameAddress)
     acquireWakeLock('sharing')
 
     elementById('share-link').value = shareLink
     sendSession.qrDataUrl = null
-    elementById('encrypt-progress-track').classList.add('hidden')
+    elementById('share-status').classList.add('hidden')
     elementById('share-ready').classList.remove('hidden')
-    setShareHeading('Ready to share', 'Send this link to the people you want to have the files.')
+    elementById('native-share').classList.toggle('hidden', typeof navigator.share !== 'function')
+    setShareHeading('Ready to share', 'Send this link to the people you want to have the files. It works while this tab stays open.')
     diagnostics.info('send', 'link ready', { linkVersion: LINK_VERSION, mode: sendSession.mode, linkCharacters: shareLink.length, senderAddress: redactNymAddress(sendSession.node.address), totalMs: Math.round(performance.now() - shareStartedAt) })
+    renderRecipients()
+    updateShareDataNotice()
     startSenderStats()
     sendSession.stopSnapshots = startSnapshots('sender', () => ({
       peers: sendSession.torrent?.numPeers,
       uploaded: sendSession.torrent?.uploaded,
       recipients: sendSession.recipients.size,
       finished: sendSession.finished.size,
+      recipientStates: [...sendSession.recipientViews.values()].map(recipientView => recipientView.state),
       nymState: sendSession.node?.state,
       framesAwaitingLink: sendSession.framesAwaitingLink.size,
       lateFramesDropped: sendSession.lateFramesDropped,
       nym: sendSession.node?.counters,
       links: describeLinks(sendSession.links.values())
     }))
-    window.addEventListener('beforeunload', warnBeforeLeaving)
-    renderIcons()
+    updateDocumentTitle()
+    elementById('copy-link').focus({ preventScroll: true })
   } catch (error) {
     showShareError(error)
+  } finally {
+    sendSession.preparing = false
   }
 }
 
@@ -1326,14 +1674,6 @@ async function startSharing (fileList) {
 // be answered, and one without a recipient id cannot be counted; both are ignored.
 function handleSenderControl (message, senderTag) {
   const torrent = sendSession.torrent
-  if (!torrent) {
-    diagnostics.warn('send', 'control message while not sharing', describeControlMessage(message))
-    return
-  }
-  if (message.infoHash !== torrent.infoHash) {
-    diagnostics.warn('send', 'control message for another share ignored', describeControlMessage(message))
-    return
-  }
   if (!senderTag) {
     diagnostics.warn('send', 'control message without reply blocks ignored', describeControlMessage(message))
     return
@@ -1343,15 +1683,19 @@ function handleSenderControl (message, senderTag) {
     diagnostics.warn('send', 'control message without a recipient id ignored', describeControlMessage(message))
     return
   }
+  const recipientView = noteRecipient(recipientId, senderTag)
   const knownRecipient = sendSession.recipients.has(recipientId)
   const limitReached = sendSession.recipientLimit > 0 && sendSession.recipients.size >= sendSession.recipientLimit && !knownRecipient
   const linkId = typeof message.linkId === 'string' && /^[0-9a-f]{32}$/.test(message.linkId) ? message.linkId : null
 
   if (message.kind === 'hello') {
+    if (limitReached && recipientView.state === 'viewing') recipientView.state = 'refused'
     sendSession.node.replyControl({ kind: limitReached ? 'refused' : 'available', infoHash: torrent.infoHash, reason: limitReached ? 'limit' : undefined, attempt: typeof message.attempt === 'number' ? message.attempt : undefined }, senderTag).catch(() => {})
   } else if (message.kind === 'open' && linkId) {
     if (limitReached) {
+      recipientView.state = 'refused'
       sendSession.node.replyControl({ kind: 'refused', infoHash: torrent.infoHash, reason: 'limit' }, senderTag).catch(() => {})
+      renderRecipients()
       return
     }
     if (sendSession.links.has(linkId) || sendSession.closedLinkIds.has(linkId)) {
@@ -1360,6 +1704,7 @@ function handleSenderControl (message, senderTag) {
     }
     const recipient = sendSession.recipients.get(recipientId) ?? { linkIds: new Set() }
     sendSession.recipients.set(recipientId, recipient)
+    recipientView.state = 'receiving'
     // A recipient reopening after a stall gets a fresh link; its old one is dead, so retire it
     // now in case the recipient's "close" message is still in flight or was lost.
     for (const previousLinkId of [...recipient.linkIds]) retireSenderLink(previousLinkId, 'replaced by a new link from the same recipient')
@@ -1386,13 +1731,36 @@ function handleSenderControl (message, senderTag) {
     if (sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'closed by the recipient')
   } else if (message.kind === 'complete') {
     sendSession.finished.add(recipientId)
+    recipientView.state = message.verified === false ? 'failed' : 'done'
     diagnostics.info('send', 'recipient finished', { finished: sendSession.finished.size, verified: message.verified, gatewayTraffic: sendSession.node?.describeGatewayTraffic() })
     // The recipient has destroyed its side, but nothing travels back over the mixnet to tell
-    // this link stream. Close it here so the wire, the Connected count and the logs settle.
+    // this link stream. Close it here so the wire, the counts and the logs settle.
     if (linkId && sendSession.links.get(linkId)?.recipientId === recipientId) retireSenderLink(linkId, 'recipient finished')
+  } else if (message.kind === 'cancel') {
+    // The recipient left. Its place under the recipient limit is freed for someone else.
+    for (const previousLinkId of [...(sendSession.recipients.get(recipientId)?.linkIds ?? [])]) retireSenderLink(previousLinkId, 'recipient cancelled')
+    sendSession.recipients.delete(recipientId)
+    recipientView.state = 'cancelled'
+    recipientView.cancelledWhile = message.stage === 'downloading' ? 'downloading' : 'before-download'
+    diagnostics.info('send', 'recipient cancelled', { stage: recipientView.cancelledWhile, recipients: sendSession.recipients.size })
   } else {
     diagnostics.warn('send', 'unexpected control message', describeControlMessage(message))
+    return
   }
+  renderRecipients()
+  updateDocumentTitle()
+}
+
+/** Returns the Recipients list entry for a recipient, creating it on first contact. */
+function noteRecipient (recipientId, senderTag) {
+  let recipientView = sendSession.recipientViews.get(recipientId)
+  if (!recipientView) {
+    recipientView = { number: sendSession.nextRecipientNumber, state: 'viewing', replyTag: senderTag, retiredBytes: 0, cancelledWhile: null }
+    sendSession.nextRecipientNumber += 1
+    sendSession.recipientViews.set(recipientId, recipientView)
+  }
+  recipientView.replyTag = senderTag
+  return recipientView
 }
 
 function retireSenderLink (linkId, reason) {
@@ -1401,8 +1769,75 @@ function retireSenderLink (linkId, reason) {
   sendSession.links.delete(linkId)
   sendSession.closedLinkIds.add(linkId)
   sendSession.recipients.get(link.recipientId)?.linkIds.delete(linkId)
+  const recipientView = sendSession.recipientViews.get(link.recipientId)
+  if (recipientView) recipientView.retiredBytes += link.stats.bytesOut
   diagnostics.info('send', 'link retired', { link: linkId.slice(0, 8), reason })
   link.destroy()
+}
+
+// The Recipients list. Each recipient is numbered in the order it first made contact; nothing
+// about it is known beyond its random session id, so a number is all the list can show.
+const RECIPIENT_STATE_ICONS = { viewing: 'user-round', receiving: 'download', done: 'circle-check', failed: 'circle-alert', cancelled: 'circle-slash', refused: 'circle-slash' }
+
+/** Share of the files sent to one recipient, from the bytes its links carried. */
+function recipientProgress (recipientId, recipientView) {
+  if (recipientView.state === 'done' || recipientView.state === 'failed') return 1
+  const totalBytes = sendSession.torrent?.length
+  if (!totalBytes) return 0
+  let bytes = recipientView.retiredBytes
+  for (const link of sendSession.links.values()) if (link.recipientId === recipientId) bytes += link.stats.bytesOut
+  // Bytes include BitTorrent messages, so the share stops short of 100 % until the recipient confirms.
+  return Math.min(0.99, bytes / totalBytes)
+}
+
+function describeRecipientState (recipientView, progress) {
+  switch (recipientView.state) {
+    case 'viewing': return 'Opened the link'
+    case 'receiving': return progress >= 0.01 ? 'Receiving, ' + Math.floor(progress * 100) + '%' : 'Connecting'
+    case 'done': return 'Received and verified'
+    case 'failed': return 'Received, but the integrity check failed'
+    case 'cancelled': return recipientView.cancelledWhile === 'downloading' ? 'Cancelled the download' : 'Left without downloading'
+    case 'refused': return 'Turned away, the limit was reached'
+    default: return ''
+  }
+}
+
+function renderRecipients () {
+  const list = elementById('recipient-list')
+  const entries = [...sendSession.recipientViews.entries()]
+  elementById('recipient-empty').classList.toggle('hidden', entries.length > 0)
+  list.classList.toggle('hidden', entries.length === 0)
+  const limit = sendSession.recipientLimit
+  elementById('recipient-count').textContent = limit > 0 ? sendSession.recipients.size + ' of ' + limit + (limit === 1 ? ' place' : ' places') + ' used' : 'No limit'
+
+  let iconsAdded = false
+  const rows = entries.map(([recipientId, recipientView]) => {
+    let row = sendSession.recipientRows.get(recipientId)
+    if (!row || row.dataset.state !== recipientView.state) {
+      const stateElement = createElement('span', { className: 'recipient-state' })
+      const bodyChildren = [createElement('div', { className: 'recipient-text' }, [createElement('span', { className: 'recipient-name', text: 'Recipient ' + recipientView.number }), stateElement])]
+      let progressFill = null
+      if (recipientView.state === 'receiving') {
+        progressFill = createElement('div')
+        bodyChildren.push(createElement('div', { className: 'recipient-progress', role: 'presentation' }, [progressFill]))
+      }
+      row = createElement('li', { className: 'recipient-row', 'data-state': recipientView.state }, [
+        createElement('i', { 'data-lucide': RECIPIENT_STATE_ICONS[recipientView.state] ?? 'user-round' }),
+        createElement('div', { className: 'recipient-body' }, bodyChildren)
+      ])
+      row.stateElement = stateElement
+      row.progressFill = progressFill
+      sendSession.recipientRows.set(recipientId, row)
+      iconsAdded = true
+    }
+    const progress = recipientProgress(recipientId, recipientView)
+    row.stateElement.textContent = describeRecipientState(recipientView, progress)
+    if (row.progressFill) row.progressFill.style.width = (progress * 100).toFixed(1) + '%'
+    return row
+  })
+  const sameRows = list.children.length === rows.length && rows.every((row, index) => list.children[index] === row)
+  if (!sameRows) list.replaceChildren(...rows)
+  if (iconsAdded) renderIcons()
 }
 
 // The node reconnects under the same identity, so the address normally stays the same and the
@@ -1419,6 +1854,7 @@ function handleSenderReconnected (sameAddress) {
   elementById('share-link').value = shareLink
   sendSession.qrDataUrl = null
   elementById('qr-image').classList.add('hidden')
+  setButtonContent(elementById('toggle-qr'), 'qr-code', 'Show QR code')
   diagnostics.warn('send', 'share link replaced after the Nym address changed', { linkCharacters: shareLink.length })
   showShareNotice('Your Nym connection was replaced and the old link no longer works. Send this new link instead.')
 }
@@ -1431,61 +1867,112 @@ function hideShareNotice () {
   elementById('share-notice').classList.add('hidden')
 }
 
+/** How much data this tab uses per hour while connected: measured once possible, else estimated. */
+function updateShareDataNotice () {
+  const node = sendSession.node
+  const mode = node?.mode ?? currentMode()
+  const measuredMegabits = node?.measuredMegabitsPerSecond?.() ?? null
+  const gigabytesPerHour = measuredMegabits === null ? ESTIMATED_GIGABYTES_PER_HOUR[mode] : measuredMegabits * 3600 / 8 / 1000
+  elementById('share-data-text').textContent = 'While this tab is open it uses about ' + gigabytesPerHour.toFixed(1) + ' GB of data an hour, even when nobody is downloading. ' +
+    (measuredMegabits === null ? 'Estimated for ' + MODE_LABELS[mode] + '.' : 'Measured on this connection.')
+}
+
 function startSenderStats () {
   const meter = new RateMeter()
   clearInterval(sendSession.statsTimer)
   sendSession.statsTimer = setInterval(() => {
     const torrent = sendSession.torrent
     if (!torrent) return
-    elementById('stat-connected').textContent = String(torrent.numPeers)
-    elementById('stat-finished').textContent = String(sendSession.finished.size)
     elementById('stat-sent').textContent = formatBytes(torrent.uploaded)
     elementById('stat-upload').textContent = formatBytes(meter.update(torrent.uploaded)) + '/s'
+    renderRecipients()
+    updateShareDataNotice()
+    updateDocumentTitle()
   }, 1000)
 }
 
 function setShareHeading (title, subtitle) {
   elementById('share-title').textContent = title
   elementById('share-subtitle').textContent = subtitle
+  elementById('share-subtitle').classList.toggle('hidden', !subtitle)
 }
 
 function showShareError (error) {
   diagnostics.error('send', 'sharing failed', error)
-  setShareHeading('Something went wrong', error?.message ?? String(error))
-  elementById('encrypt-progress-track').classList.add('hidden')
+  const message = error?.message ?? String(error)
+  if (sendSession.linkFields) {
+    // The link is already out; keep sharing and show what went wrong.
+    showShareNotice('Something went wrong: ' + message)
+    return
+  }
+  setShareHeading('Could not prepare the link', '')
+  elementById('share-status').classList.remove('hidden')
+  renderStatus('share', { tone: 'error', icon: 'circle-alert', text: 'Something went wrong', caption: message, progress: null })
+  elementById('share-error-actions').classList.remove('hidden')
 }
 
-function showChooseError (text) {
-  const dropZone = elementById('drop-zone')
-  dropZone.querySelector('.muted').textContent = text
-}
-
-function warnBeforeLeaving (event) {
-  event.preventDefault()
-  event.returnValue = ''
-}
-
-async function stopSharing () {
-  diagnostics.info('send', 'stopping', { uploaded: sendSession.torrent?.uploaded, recipients: sendSession.recipients.size, finished: sendSession.finished.size, links: describeLinks(sendSession.links.values()) })
-  window.removeEventListener('beforeunload', warnBeforeLeaving)
-  releaseWakeLock('sharing')
+/** Puts the share view back to its initial state, ready for the next files. */
+function resetShareView () {
+  elementById('share-ready').classList.add('hidden')
+  elementById('share-status').classList.remove('hidden')
+  elementById('share-error-actions').classList.add('hidden')
+  elementById('qr-image').classList.add('hidden')
+  elementById('qr-image').removeAttribute('src')
+  elementById('toggle-qr').setAttribute('aria-expanded', 'false')
+  setButtonContent(elementById('toggle-qr'), 'qr-code', 'Show QR code')
+  setButtonContent(elementById('copy-link'), 'copy', 'Copy link')
+  elementById('share-link').value = ''
+  elementById('recipient-list').replaceChildren()
+  elementById('share-file-list').replaceChildren()
+  elementById('share-file-summary').textContent = ''
+  elementById('stat-sent').textContent = '0 B'
+  elementById('stat-upload').textContent = '0 B/s'
+  elementById('stop-sharing').disabled = false
   hideShareNotice()
+}
+
+async function requestStopSharing () {
+  const receiving = [...sendSession.recipientViews.values()].filter(recipientView => recipientView.state === 'receiving').length
+  const confirmed = await confirmAction({
+    title: 'Stop sharing?',
+    message: receiving
+      ? (receiving === 1 ? 'One person is still receiving the files.' : receiving + ' people are still receiving the files.') + ' They will be told you stopped, and the link will stop working.'
+      : 'The link will stop working. Anyone you sent it to will not be able to download the files.',
+    confirmLabel: 'Stop sharing',
+    cancelLabel: 'Keep sharing'
+  })
+  if (confirmed) await stopSharing({ notifyRecipients: true })
+}
+
+async function stopSharing ({ notifyRecipients }) {
+  const torrent = sendSession.torrent
+  const node = sendSession.node
+  diagnostics.info('send', 'stopping', { uploaded: torrent?.uploaded, recipients: sendSession.recipients.size, finished: sendSession.finished.size, links: describeLinks(sendSession.links.values()) })
+  elementById('stop-sharing').disabled = true
+  if (torrent) stoppedShareInfoHashes.add(torrent.infoHash)
+  // Tell everyone who has not finished, through the reply blocks they sent, so no recipient is
+  // left waiting for an answer that will never come.
+  if (notifyRecipients && torrent && node) {
+    const notices = []
+    for (const recipientView of sendSession.recipientViews.values()) {
+      if (recipientView.replyTag && (recipientView.state === 'viewing' || recipientView.state === 'receiving')) {
+        notices.push(node.replyControl({ kind: 'stopped', infoHash: torrent.infoHash }, recipientView.replyTag))
+      }
+    }
+    if (notices.length > 0) {
+      await Promise.race([Promise.allSettled(notices), new Promise(resolve => setTimeout(resolve, STOP_NOTICE_WAIT_MS))])
+      diagnostics.info('send', 'told recipients that sharing stopped', { recipients: notices.length })
+    }
+  }
+  releaseWakeLock('sharing')
   clearInterval(sendSession.statsTimer)
   sendSession.stopSnapshots?.()
   if (sendSession.client) await new Promise(resolve => sendSession.client.destroy(resolve))
-  if (sendSession.node) {
-    sendSession.node.onControl = null
-    sendSession.node.onData = null
-    sendSession.node.onReconnected = null
-  }
-  Object.assign(sendSession, { torrent: null, client: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), qrDataUrl: null, stopSnapshots: null, linkFields: null })
+  Object.assign(sendSession, { torrent: null, client: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), qrDataUrl: null, stopSnapshots: null, linkFields: null, recipientViews: new Map(), recipientRows: new Map(), nextRecipientNumber: 1, statsTimer: null, preparing: false })
   diagnostics.info('send', 'stopped')
-  elementById('share-ready').classList.add('hidden')
-  elementById('qr-image').classList.add('hidden')
-  elementById('encrypt-progress-track').classList.remove('hidden')
-  elementById('encrypt-progress').style.width = '0%'
-  elementById('file-input').value = ''
+  resetShareView()
   showView('view-choose')
+  noteUserActivity()
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,8 +1980,136 @@ async function stopSharing () {
 // ---------------------------------------------------------------------------
 // recipientId: random per receiving session; the sender counts it against the recipient limit
 // and lets it reopen links after a stall. retiredLinkIds: links replaced after a stall, whose
-// late frames are dropped. stall: the recovery state (see checkReceiverHealth).
-const receiveSession = { link: null, keychain: null, files: null, client: null, torrent: null, node: null, linkStream: null, LinkStream: null, results: null, replyTimer: null, statsTimer: null, monitorTimer: null, recipientId: null, downloading: false, retiredLinkIds: new Set(), lateFramesDropped: 0, linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0, helloSentAt: new Map(), roundTrips: [] }
+// late frames are dropped. stall: the recovery state (see checkReceiverHealth). token: changes
+// whenever the person leaves the receive view, so work still in flight for an earlier link can
+// tell that it no longer applies.
+function createReceiveSessionState () {
+  return {
+    link: null, keychain: null, files: null, totalBytes: 0, client: null, torrent: null, node: null, linkStream: null, LinkStream: null,
+    results: null, savedIndexes: new Set(), replyTimer: null, giveUpTimer: null, uiTimer: null, monitorTimer: null, stopSnapshots: null,
+    recipientId: null, downloading: false, downloadRequested: false, senderOnline: false, retiredLinkIds: new Set(), lateFramesDropped: 0,
+    linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0, helloSentAt: new Map(), roundTrips: [],
+    stage: null, stageStartedAt: 0, stageCaption: null, rateMeter: null, downloadStartedAt: 0, token: 0
+  }
+}
+const receiveSession = createReceiveSessionState()
+
+// What the receive view shows in each stage. progress 'transfer' follows the download.
+const RECEIVE_STAGE_DISPLAY = {
+  opening: { icon: 'loader-circle', spin: true, text: 'Opening the link', caption: 'Decrypting the file list from the link.', progress: 'indeterminate' },
+  connecting: { icon: 'loader-circle', spin: true, text: 'Connecting to Nym', caption: 'Joining the mixnet. This usually takes 5 to 10 seconds.', progress: 'indeterminate', timed: true },
+  reaching: { icon: 'loader-circle', spin: true, text: 'Reaching the sender', caption: "Asking the sender's tab whether it is online. This usually takes a few seconds.", progress: 'indeterminate', timed: true },
+  'reaching-slow': { tone: 'warning', icon: 'hourglass', text: 'Still trying to reach the sender', caption: "The sender's tab may be closed, asleep or offline. This page keeps asking for 3 minutes.", progress: 'indeterminate', timed: true },
+  online: { tone: 'positive', icon: 'circle-check', text: 'The sender is online', caption: 'Download when you are ready.', progress: null },
+  'setting-up': { icon: 'loader-circle', spin: true, text: 'Setting up the transfer', caption: 'Exchanging the first messages with the sender. This usually takes 5 to 10 seconds.', progress: 'indeterminate', timed: true },
+  receiving: { icon: 'download', text: 'Receiving', caption: '', progress: 'transfer', timed: true },
+  reconnecting: { tone: 'warning', icon: 'loader-circle', spin: true, text: 'Reconnecting to the sender', caption: 'The transfer paused. What you have received so far is kept.', progress: 'transfer', timed: true },
+  'waiting-sender': { tone: 'warning', icon: 'hourglass', text: 'Waiting for the sender', caption: "The sender's tab may be closed, asleep or offline. What you have received so far is kept.", progress: 'transfer', timed: true },
+  lost: { tone: 'error', icon: 'circle-alert', text: 'Lost contact with the sender', caption: "What you have received so far is kept. Try again once the sender's tab is open.", progress: 'transfer' },
+  checking: { icon: 'loader-circle', spin: true, text: 'Checking the files', caption: 'Decrypting each file and comparing it with what the sender shared.', progress: 1 },
+  done: { tone: 'positive', icon: 'circle-check', text: 'Received and verified', caption: '', progress: null },
+  'failed-check': { tone: 'error', icon: 'circle-alert', text: 'A file failed the integrity check', caption: 'At least one file does not match what the sender shared. Do not trust it.', progress: null },
+  unreachable: { tone: 'error', icon: 'circle-alert', text: 'The sender is not answering', caption: "Links only work while the sender keeps their tab open. Their tab may be closed, asleep or offline.", progress: null },
+  stopped: { tone: 'neutral', icon: 'circle-slash', text: 'The sender stopped sharing', caption: 'Ask them for a new link if you still need the files.', progress: null },
+  full: { tone: 'neutral', icon: 'circle-slash', text: 'This share is full', caption: 'The sender limited how many people can download, and that limit has been reached.', progress: null },
+  refused: { tone: 'neutral', icon: 'circle-slash', text: 'The sender refused the connection', caption: '', progress: null },
+  'invalid-link': { tone: 'error', icon: 'circle-alert', text: 'This link does not work', caption: 'The key in the link could not decrypt the file list. Check that the whole link was copied.', progress: null },
+  error: { tone: 'error', icon: 'circle-alert', text: 'Something went wrong', caption: '', progress: null }
+}
+// Stages in which nothing is in progress: the page may disconnect from Nym after a while.
+const RECEIVE_TERMINAL_STAGES = new Set(['done', 'failed-check', 'unreachable', 'stopped', 'full', 'refused', 'invalid-link', 'error'])
+// Stages from which Try again starts over.
+const RECEIVE_RETRY_STAGES = new Set(['unreachable', 'lost', 'error'])
+
+function setReceiveStage (stage, { caption = null, keepTimer = false } = {}) {
+  if (receiveSession.stage !== stage) {
+    diagnostics.info('receive', 'stage ' + stage)
+    receiveSession.stage = stage
+    if (!keepTimer) receiveSession.stageStartedAt = performance.now()
+  }
+  receiveSession.stageCaption = caption
+  renderReceiveStatus()
+  updateDocumentTitle()
+}
+
+function renderReceiveStatus () {
+  const stage = receiveSession.stage
+  const display = RECEIVE_STAGE_DISPLAY[stage]
+  if (!display) return
+  let progress = display.progress
+  if (progress === 'transfer') progress = receiveSession.torrent ? receiveSession.torrent.progress : 0
+  const text = stage === 'receiving' ? 'Receiving, ' + Math.floor(progress * 100) + '%' : display.text
+  renderStatus('receive', {
+    tone: display.tone ?? 'neutral',
+    icon: display.icon,
+    spin: Boolean(display.spin),
+    text,
+    caption: receiveSession.stageCaption ?? display.caption,
+    progress,
+    startedAt: display.timed ? receiveSession.stageStartedAt : null
+  })
+  updateReceiveControls()
+}
+
+/** Shows the buttons that fit the current stage: Back, Cancel or Done; Download; Try again; Save. */
+function updateReceiveControls () {
+  const stage = receiveSession.stage
+  const finished = stage === 'done' || stage === 'failed-check'
+  const navigation = finished ? 'done' : receiveSession.downloading ? 'cancel' : 'back'
+  const navigationButton = elementById('receive-back')
+  if (navigationButton.dataset.kind !== navigation) {
+    navigationButton.dataset.kind = navigation
+    navigationButton.dataset.tone = navigation === 'cancel' ? 'destructive' : ''
+    if (navigation === 'back') setIcon(elementById('receive-back-icon'), 'chevron-left')
+    else elementById('receive-back-icon').replaceChildren()
+    elementById('receive-back-label').textContent = navigation === 'done' ? 'Done' : navigation === 'cancel' ? 'Cancel' : 'Back'
+    navigationButton.setAttribute('aria-label', navigation === 'done' ? 'Done, return to the start page' : navigation === 'cancel' ? 'Cancel the download' : 'Back to the start page')
+  }
+
+  const downloadButton = elementById('start-download')
+  const canDownload = Boolean(receiveSession.files) && !receiveSession.downloading && !finished && !RECEIVE_TERMINAL_STAGES.has(stage) && stage !== 'checking' && stage !== 'lost'
+  downloadButton.classList.toggle('hidden', !canDownload)
+  if (canDownload) {
+    const waiting = receiveSession.downloadRequested
+    downloadButton.disabled = waiting
+    downloadButton.dataset.busy = String(waiting)
+    if (waiting) setButtonContent(downloadButton, 'loader-circle', 'Starts when the sender answers')
+    else setButtonContent(downloadButton, 'download', receiveSession.files.length === 1 ? 'Download' : 'Download all')
+  }
+  elementById('try-again').classList.toggle('hidden', !RECEIVE_RETRY_STAGES.has(stage))
+  const saveAll = elementById('save-all')
+  saveAll.classList.toggle('hidden', stage !== 'done')
+  if (stage === 'done') setButtonContent(saveAll, 'download', receiveSession.files.length === 1 ? 'Save file' : 'Save all')
+  elementById('receive-stats').classList.toggle('hidden', !receiveSession.downloading)
+}
+
+function setReceiveHeading (title, subtitle) {
+  elementById('receive-title').textContent = title
+  elementById('receive-subtitle').textContent = subtitle
+  elementById('receive-subtitle').classList.toggle('hidden', !subtitle)
+}
+function showReceiveNotice (tone, text) {
+  const notice = elementById('receive-notice')
+  notice.dataset.tone = tone
+  elementById('receive-notice-text').textContent = text
+  notice.classList.remove('hidden')
+}
+function hideReceiveNotice () {
+  elementById('receive-notice').classList.add('hidden')
+}
+
+/** Puts the receive view back to its initial state. */
+function resetReceiveView () {
+  setReceiveHeading('Files for you', '')
+  elementById('receive-file-list').replaceChildren()
+  elementById('receive-file-summary').textContent = ''
+  elementById('receive-mode').textContent = ''
+  elementById('stat-received').textContent = '0 B'
+  elementById('stat-download').textContent = '0 B/s'
+  elementById('stat-eta').textContent = 'Estimating'
+  delete elementById('receive-back').dataset.kind
+  hideReceiveNotice()
+}
 
 // Round-trip samples to the sender: each answered hello (matched by its attempt number) and the
 // time from opening a link to its first frame. The slowest recent sample sets the thresholds.
@@ -1521,58 +2136,102 @@ function newStallState () {
   return { stage: 'healthy', relinks: 0, senderChecks: 0, lastSenderCheckAt: 0, stalledAt: 0, relinkedAt: 0 }
 }
 
-async function openShareLink (linkText) {
+/** The page address without the link's #fragment, which holds the key. */
+function cleanPageUrl () {
+  return location.pathname + location.search
+}
+
+/**
+ * Opens a share link. The key never stays in the address bar or the session history: a link from
+ * the address bar has its entry replaced with the bare page address, and the receive view gets its
+ * own history entry (also without the key) so the browser's Back button returns to the start page.
+ */
+async function openShareLink (linkText, { fromAddressBar = false } = {}) {
   const link = parseShareLink(linkText)
   if (!link) {
-    diagnostics.warn('receive', 'not a valid share link', { characters: linkText.length, hasHash: linkText.includes('#') })
-    elementById('paste-input').setCustomValidity('This is not a Nym Share link.')
-    elementById('paste-input').reportValidity()
+    diagnostics.warn('receive', 'not a valid share link', { characters: linkText.length, hasHash: linkText.includes('#'), fromAddressBar })
+    if (fromAddressBar) {
+      history.replaceState({ view: 'choose' }, '', cleanPageUrl())
+      showPasteError('The link in the address bar is incomplete. Paste the whole link here.')
+    } else {
+      showPasteError(linkText ? 'This is not a Nym Share link. Check that the whole link was copied.' : 'Paste the link you were sent.')
+    }
     return
   }
-  diagnostics.info('receive', 'opening link', { linkVersion: link.linkVersion, mode: link.mode, infoHash: link.infoHash.slice(0, 8), sender: redactNymAddress(link.senderAddress), linkCharacters: linkText.length })
-  if (location.hash.slice(1) !== linkText.slice(linkText.indexOf('#') + 1)) history.replaceState(null, '', '#' + linkText.slice(linkText.indexOf('#') + 1))
+  showPasteError('')
+  elementById('paste-input').value = ''
+  diagnostics.info('receive', 'opening link', { linkVersion: link.linkVersion, senderMode: link.mode, infoHash: link.infoHash.slice(0, 8), sender: redactNymAddress(link.senderAddress), linkCharacters: linkText.length, fromAddressBar })
+  if (fromAddressBar) history.replaceState({ view: 'choose' }, '', cleanPageUrl())
+  history.pushState({ view: 'receive' }, '', cleanPageUrl())
+
+  Object.assign(receiveSession, createReceiveSessionState(), { token: receiveSession.token + 1 })
+  const token = receiveSession.token
   receiveSession.link = link
+  resetReceiveView()
   showView('view-receive')
+  setReceiveStage('opening')
+  clearInterval(receiveSession.uiTimer)
+  receiveSession.uiTimer = setInterval(updateReceiveProgress, 1000)
 
   try {
     const { Keychain } = await loadLibraries()
     receiveSession.keychain = new Keychain(link.keyB64Url, base64UrlToBytes(link.saltB64Url))
     // The file list is decrypted locally from the link; no network request is needed.
-    receiveSession.files = JSON.parse(textDecoder.decode(await receiveSession.keychain.decryptMeta(base64UrlToBytes(link.encryptedListB64Url))))
-    diagnostics.info('receive', 'file list decrypted from link', { files: receiveSession.files.length, fileSizes: receiveSession.files.map(file => file.size), plaintextHashPrefixes: receiveSession.files.map(file => String(file.sha256).slice(0, 8)) })
+    const files = JSON.parse(textDecoder.decode(await receiveSession.keychain.decryptMeta(base64UrlToBytes(link.encryptedListB64Url))))
+    if (receiveSession.token !== token) return
+    receiveSession.files = files
+    receiveSession.totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+    diagnostics.info('receive', 'file list decrypted from link', { files: files.length, fileSizes: files.map(file => file.size), plaintextHashPrefixes: files.map(file => String(file.sha256).slice(0, 8)) })
   } catch (error) {
+    if (receiveSession.token !== token) return
     diagnostics.error('receive', 'file list could not be decrypted', error)
-    setReceiveHeading('This link does not work', 'The key in the link could not decrypt the file list. Check that the whole link was copied.')
-    showReceiveNotice('error', 'Decryption failed: ' + (error?.message ?? String(error)))
+    setReceiveHeading('This link does not work', '')
+    setReceiveStage('invalid-link')
     return
   }
 
-  const totalBytes = receiveSession.files.reduce((sum, file) => sum + file.size, 0)
-  setReceiveHeading(receiveSession.files.length === 1 ? 'A file for you' : receiveSession.files.length + ' files for you', formatBytes(totalBytes) + ' in total. Checking whether the sender is online.')
-  renderFileRows(elementById('receive-file-list'), receiveSession.files)
+  const files = receiveSession.files
+  setReceiveHeading(files.length === 1 ? 'A file for you' : files.length + ' files for you', 'Encrypted end to end. Only people with this link can open them.')
+  renderFileRows(elementById('receive-file-list'), files)
+  elementById('receive-file-summary').textContent = describeFileTotals(files)
+  // Each side runs its own network mode; they do not need to match.
+  elementById('receive-mode').textContent = 'Your network mode: ' + MODE_LABELS[currentMode()] + '. The sender is using ' + MODE_LABELS[link.mode] + '.'
+  await connectReceiver()
+}
 
-  // Run the client in the sender's mode. If this page already connected in another mode
-  // (for example Balanced on load before a Maximum link was pasted), getNymNode switches it.
-  const selectedMode = elementById('privacy-mode').value
-  elementById('receive-mode').textContent = 'Network mode: ' + MODE_LABELS[link.mode] + ', set by the sender.' + (selectedMode !== link.mode ? ' Your own setting, ' + MODE_LABELS[selectedMode] + ', applies only to files you send.' : '')
-  if (selectedMode !== link.mode) diagnostics.info('receive', 'using the sender\'s network mode instead of this page\'s setting', { senderMode: link.mode, pageSetting: selectedMode })
+/** Joins Nym (reusing the running client) and asks the sender whether it is online. */
+async function connectReceiver () {
+  const token = receiveSession.token
+  receiveSession.senderOnline = false
+  setReceiveStage(currentNymNode ? 'reaching' : 'connecting')
+  let node
   try {
-    receiveSession.node = await getNymNode(link.mode)
+    node = await getNymNode(currentMode())
   } catch (error) {
+    if (receiveSession.token !== token) return
     diagnostics.error('receive', 'could not join Nym', error)
-    showReceiveNotice('error', error.message)
+    setReceiveStage('error', { caption: 'Could not connect to the Nym network: ' + (error?.message ?? String(error)) })
     return
   }
-  receiveSession.recipientId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
-  receiveSession.node.onControl = (message, senderTag) => handleReceiverControl(message, senderTag)
-  receiveSession.node.onData = frame => routeReceiverFrame(frame)
+  if (receiveSession.token !== token) return
+  receiveSession.node = node
+  if (!receiveSession.recipientId) receiveSession.recipientId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
+  setReceiveStage('reaching')
   startHelloRetries()
   clearTimeout(receiveSession.replyTimer)
+  clearTimeout(receiveSession.giveUpTimer)
   receiveSession.replyTimer = setTimeout(() => {
+    if (receiveSession.token !== token || receiveSession.stage !== 'reaching') return
     diagnostics.warn('receive', 'sender did not answer within ' + SENDER_REPLY_TIMEOUT_MS / 1000 + ' s; still trying', { hellosSent: receiveSession.hellosSent })
-    setReceiveHeading(elementById('receive-title').textContent, 'The sender has not answered yet.')
-    showReceiveNotice('warning', 'The sender is not reachable yet. Their tab may be closed, asleep or offline. This page keeps trying.')
+    setReceiveStage('reaching-slow', { keepTimer: true })
   }, SENDER_REPLY_TIMEOUT_MS)
+  receiveSession.giveUpTimer = setTimeout(() => {
+    if (receiveSession.token !== token || (receiveSession.stage !== 'reaching' && receiveSession.stage !== 'reaching-slow')) return
+    stopHelloRetries()
+    receiveSession.downloadRequested = false
+    diagnostics.warn('receive', 'sender did not answer within ' + RECEIVER_GIVE_UP_MS / 1000 + ' s; stopped asking', { hellosSent: receiveSession.hellosSent })
+    setReceiveStage('unreachable')
+  }, RECEIVER_GIVE_UP_MS)
 }
 
 // Sends "hello" now and repeats it until the sender answers or refuses. Each repeat carries the
@@ -1604,62 +2263,84 @@ function stopHelloRetries () {
 }
 
 function handleReceiverControl (message) {
-  if (message.infoHash !== receiveSession.link?.infoHash) {
-    diagnostics.warn('receive', 'control message for another share ignored', describeControlMessage(message))
-    return
-  }
   const helloSentAt = typeof message.attempt === 'number' ? receiveSession.helloSentAt.get(message.attempt) : undefined
   const replyMs = helloSentAt === undefined ? null : Math.round(performance.now() - helloSentAt)
   if (replyMs !== null && (message.kind === 'available' || message.kind === 'refused')) recordRoundTrip('hello ' + message.attempt, replyMs)
-  if (message.kind === 'available' && receiveSession.downloading) {
+  const finished = receiveSession.stage === 'done' || receiveSession.stage === 'failed-check' || receiveSession.stage === 'checking'
+
+  if (message.kind === 'stopped') {
+    diagnostics.warn('receive', 'the sender stopped sharing', { downloading: receiveSession.downloading })
+    if (finished) return
+    endReceiverTransfer()
+    setReceiveStage('stopped')
+    return
+  }
+  if (message.kind === 'refused') {
+    diagnostics.warn('receive', 'sender refused', { reason: message.reason, roundTripMs: replyMs })
+    if (finished) return
+    endReceiverTransfer()
+    setReceiveStage(message.reason === 'limit' ? 'full' : 'refused')
+    return
+  }
+  if (message.kind !== 'available') {
+    diagnostics.warn('receive', 'unexpected control message', describeControlMessage(message))
+    return
+  }
+  if (receiveSession.downloading) {
     // An answer to a sender check made during a stall: the sender is up, so open a fresh link.
-    if (receiveSession.stall.stage === 'checking-sender') {
-      diagnostics.info('receive', 'sender answered during a stall; opening a new link', { roundTripMs: replyMs, senderChecks: receiveSession.stall.senderChecks })
-      receiveSession.stall.stage = 'relinked'
-      receiveSession.stall.relinks += 1
-      showReceiveNotice('warning', 'The sender is online again. Resuming the transfer.')
+    const stall = receiveSession.stall
+    if (stall.stage === 'checking-sender' || stall.stage === 'gave-up') {
+      diagnostics.info('receive', 'sender answered during a stall; opening a new link', { roundTripMs: replyMs, senderChecks: stall.senderChecks })
+      stall.stage = 'relinked'
+      stall.relinks += 1
+      setReceiveStage('reconnecting')
       openReceiverLink('sender answered after a stall')
     }
     return
   }
-  if (message.kind === 'available' && !receiveSession.helloTimer && !elementById('start-download').disabled) {
+  if (receiveSession.senderOnline) {
     // Repeated hellos can each be answered; only the first answer matters.
     diagnostics.info('receive', 'extra answer to an earlier hello', { answeredAttempt: message.attempt ?? null })
     return
   }
-  if (message.kind === 'available') {
-    clearTimeout(receiveSession.replyTimer)
-    stopHelloRetries()
-    diagnostics.info('receive', 'sender is online', { roundTripMs: replyMs, hellosSent: receiveSession.hellosSent, sinceFirstHelloMs: Math.round(performance.now() - receiveSession.helloStartedAt), answeredAttempt: message.attempt ?? null })
-    hideReceiveNotice()
-    elementById('receive-subtitle').textContent = 'The sender is online. Files arrive through the Nym mixnet.'
-    elementById('start-download').disabled = false
-  } else if (message.kind === 'refused') {
-    clearTimeout(receiveSession.replyTimer)
-    stopHelloRetries()
-    if (receiveSession.downloading) {
-      receiveSession.downloading = false
-      clearInterval(receiveSession.monitorTimer)
-      releaseWakeLock('receiving')
-    }
-    diagnostics.warn('receive', 'sender refused', { reason: message.reason, roundTripMs: replyMs })
-    elementById('start-download').disabled = true
-    showReceiveNotice('error', message.reason === 'limit' ? 'The sender set a recipient limit, and it has been reached.' : 'The sender refused the connection.')
-  } else {
-    diagnostics.warn('receive', 'unexpected control message', describeControlMessage(message))
+  if (finished || (RECEIVE_TERMINAL_STAGES.has(receiveSession.stage) && receiveSession.stage !== 'unreachable')) return
+  receiveSession.senderOnline = true
+  clearTimeout(receiveSession.replyTimer)
+  clearTimeout(receiveSession.giveUpTimer)
+  stopHelloRetries()
+  diagnostics.info('receive', 'sender is online', { roundTripMs: replyMs, hellosSent: receiveSession.hellosSent, sinceFirstHelloMs: Math.round(performance.now() - receiveSession.helloStartedAt), answeredAttempt: message.attempt ?? null, downloadAlreadyRequested: receiveSession.downloadRequested })
+  if (receiveSession.downloadRequested) beginDownload()
+  else setReceiveStage('online')
+}
+
+/** Download pressed. Before the sender has answered, the download waits for that answer. */
+function requestDownload () {
+  if (receiveSession.downloading || !receiveSession.files) return
+  if (!receiveSession.senderOnline) {
+    receiveSession.downloadRequested = true
+    diagnostics.info('receive', 'download requested before the sender answered; it starts on the answer')
+    updateReceiveControls()
+    return
   }
+  beginDownload()
+}
+
+function beginDownload () {
+  receiveSession.downloadRequested = false
+  startDownload().catch(error => {
+    diagnostics.error('receive', 'download could not start', error)
+    endReceiverTransfer()
+    setReceiveStage('error', { caption: error?.message ?? String(error) })
+  })
 }
 
 async function startDownload () {
   const link = receiveSession.link
   const { WebTorrent } = await loadLibraries()
-  elementById('start-download').disabled = true
-  elementById('receive-progress-track').classList.remove('hidden')
-  elementById('receive-stats').classList.remove('hidden')
-  // The first ~10 s go to the BitTorrent handshake and metadata exchange over the mixnet.
-  elementById('receive-subtitle').textContent = 'Connecting to the sender through the mixnet, then receiving the encrypted files.'
-
+  receiveSession.downloading = true
   receiveSession.downloadStartedAt = performance.now()
+  receiveSession.rateMeter = new RateMeter()
+  setReceiveStage('setting-up')
   diagnostics.info('receive', 'download started')
   receiveSession.client = new WebTorrent({ tracker: false, dht: false, lsd: false, webSeeds: false })
   receiveSession.client.on('error', error => {
@@ -1672,8 +2353,8 @@ async function startDownload () {
   instrumentTorrent(torrent, 'receiver')
   widenRequestWindow(torrent)
   await new Promise(resolve => torrent.infoHash ? resolve() : torrent.once('infoHash', resolve))
+  if (!receiveSession.downloading || receiveSession.torrent !== torrent) return
 
-  receiveSession.downloading = true
   receiveSession.stall = newStallState()
   openReceiverLink('download started')
   acquireWakeLock('receiving')
@@ -1687,23 +2368,29 @@ async function startDownload () {
     requestsInFlight: torrent.wires.reduce((sum, wire) => sum + wire.requests.length, 0),
     peerChoking: torrent.wires.map(wire => wire.peerChoking),
     nymState: receiveSession.node.state,
+    stage: receiveSession.stage,
     stall: Object.assign({ quietMs: Date.now() - receiveSession.lastDataAt, linkGeneration: receiveSession.linkGeneration, lateFramesDropped: receiveSession.lateFramesDropped, roundTripsMs: receiveSession.roundTrips }, receiveSession.stall, stallThresholds()),
     nym: receiveSession.node.counters,
     links: describeLinks([receiveSession.linkStream])
   }))
+  torrent.once('done', () => finishDownload(torrent))
+}
 
-  const totalBytes = receiveSession.files.reduce((sum, file) => sum + file.size, 0)
-  const meter = new RateMeter()
-  receiveSession.statsTimer = setInterval(() => {
-    const received = Math.min(totalBytes, Math.round(torrent.progress * totalBytes))
-    const speed = meter.update(torrent.downloaded)
-    elementById('receive-progress').style.width = (torrent.progress * 100).toFixed(1) + '%'
+/** Runs every second while the receive view is open: elapsed time, progress, speed, time left. */
+function updateReceiveProgress () {
+  const torrent = receiveSession.torrent
+  if (receiveSession.downloading && torrent) {
+    const received = Math.min(receiveSession.totalBytes, Math.round(torrent.progress * receiveSession.totalBytes))
+    const speed = receiveSession.rateMeter.update(torrent.downloaded)
     elementById('stat-received').textContent = formatBytes(received)
     elementById('stat-download').textContent = formatBytes(speed) + '/s'
     elementById('stat-eta').textContent = torrent.length && speed > 0 ? formatDuration((torrent.length - torrent.downloaded) / speed) : 'Estimating'
-  }, 1000)
-
-  torrent.once('done', () => finishDownload(torrent))
+    if (receiveSession.stage === 'setting-up' && torrent.downloaded > 0) setReceiveStage('receiving')
+    else renderReceiveStatus()
+    updateDocumentTitle()
+    return
+  }
+  renderElapsed('receive')
 }
 
 // Opens a link to the sender and adds it to the torrent as a peer. A link that already exists
@@ -1728,8 +2415,8 @@ function openReceiverLink (reason) {
   receiveSession.linkStream = linkStream
   receiveSession.lastDataAt = Date.now()
   receiveSession.stall.relinkedAt = Date.now()
-  // WebTorrent closes a peer whose BitTorrent handshake never arrives (after about 25 s), and a
-  // link can also fail on a write error. Either way, waiting longer on it cannot help.
+  // WebTorrent closes a peer whose BitTorrent handshake never arrives, and a link can also fail
+  // on a write error. Either way, waiting longer on it cannot help.
   linkStream.once('close', () => {
     if (linkStream.retiredByReceiver || receiveSession.linkStream !== linkStream || !receiveSession.downloading) return
     diagnostics.warn('receive', 'the link closed before the transfer finished', { linkGeneration: receiveSession.linkGeneration, framesIn: linkStream.stats.framesIn })
@@ -1763,8 +2450,7 @@ function noteReceiverData () {
   if (!stall || stall.stage === 'healthy') return
   diagnostics.info('receive', 'transfer resumed', { pausedMs: Date.now() - stall.stalledAt, relinks: stall.relinks, senderChecks: stall.senderChecks, linkGeneration: receiveSession.linkGeneration })
   stall.stage = 'healthy'
-  hideReceiveNotice()
-  elementById('receive-subtitle').textContent = 'Receiving the encrypted files through the Nym mixnet.'
+  setReceiveStage(receiveSession.torrent?.downloaded > 0 ? 'receiving' : 'setting-up')
 }
 
 // Runs every STALL_CHECK_INTERVAL_MS while downloading. While this page's own Nym client is
@@ -1774,6 +2460,7 @@ function checkReceiverHealth () {
   const node = receiveSession.node
   if (node.state !== 'connected') return
   const stall = receiveSession.stall
+  if (stall.stage === 'gave-up') return
   const now = Date.now()
   const quietMs = now - receiveSession.lastDataAt
   const torrent = receiveSession.torrent
@@ -1791,8 +2478,14 @@ function checkReceiverHealth () {
     stall.stalledAt = receiveSession.lastDataAt
     stall.relinks += 1
     diagnostics.warn('receive', 'no data for ' + Math.round(quietMs / 1000) + ' s; opening a new link', Object.assign(transferState(), thresholds))
-    showReceiveNotice('warning', 'The transfer paused. Reconnecting to the sender.')
+    setReceiveStage('reconnecting')
     openReceiverLink('stalled')
+    return
+  }
+  if (stall.stage === 'checking-sender' && now - stall.stalledAt >= RECEIVER_STALL_GIVE_UP_MS) {
+    stall.stage = 'gave-up'
+    diagnostics.warn('receive', 'no data for ' + Math.round((now - stall.stalledAt) / 1000) + ' s and no answer from the sender; stopped asking', transferState())
+    setReceiveStage('lost')
     return
   }
   if (stall.stage !== 'healthy' && now - stall.relinkedAt >= thresholds.senderCheckAfterRelinkMs && now - stall.lastSenderCheckAt >= thresholds.senderCheckIntervalMs) {
@@ -1810,14 +2503,52 @@ function checkSenderDuringStall (reason, details = {}) {
   stall.lastSenderCheckAt = Date.now()
   stall.senderChecks += 1
   diagnostics.warn('receive', 'checking whether the sender is online', Object.assign({ reason, senderChecks: stall.senderChecks }, details))
-  showReceiveNotice('warning', 'Waiting for the sender. Their tab may be closed, asleep or offline. This page keeps trying.')
+  if (receiveSession.stage !== 'waiting-sender') setReceiveStage('waiting-sender')
   sendNumberedHello()
 }
 
+/** Try again: after the sender stopped answering, before or during the download. */
+function retryReceive () {
+  diagnostics.info('receive', 'trying again', { stage: receiveSession.stage })
+  if (receiveSession.stage === 'lost' && receiveSession.downloading && receiveSession.stall) {
+    receiveSession.stall.stage = 'checking-sender'
+    receiveSession.stall.stalledAt = Date.now()
+    checkSenderDuringStall('trying again')
+    return
+  }
+  if (receiveSession.downloading) endReceiverTransfer()
+  connectReceiver()
+}
+
+/** Stops everything this download has running: hellos, timers, the torrent and the wake lock. */
+function endReceiverTransfer () {
+  stopHelloRetries()
+  clearTimeout(receiveSession.replyTimer)
+  clearTimeout(receiveSession.giveUpTimer)
+  clearInterval(receiveSession.monitorTimer)
+  receiveSession.monitorTimer = null
+  receiveSession.stopSnapshots?.()
+  receiveSession.stopSnapshots = null
+  receiveSession.downloadRequested = false
+  if (receiveSession.linkStream && !receiveSession.linkStream.destroyed) {
+    receiveSession.linkStream.retiredByReceiver = true
+    receiveSession.linkStream.destroy()
+  }
+  if (receiveSession.client) {
+    const client = receiveSession.client
+    receiveSession.client = null
+    client.destroy(error => { if (error) diagnostics.warn('receive', 'webtorrent client did not close cleanly', error) })
+  }
+  receiveSession.downloading = false
+  receiveSession.torrent = null
+  receiveSession.linkStream = null
+  releaseWakeLock('receiving')
+}
+
 async function finishDownload (torrent) {
+  if (receiveSession.torrent !== torrent) return
   receiveSession.downloading = false
   clearInterval(receiveSession.monitorTimer)
-  clearInterval(receiveSession.statsTimer)
   receiveSession.stopSnapshots?.()
   releaseWakeLock('receiving')
   hideReceiveNotice()
@@ -1833,8 +2564,7 @@ async function finishDownload (torrent) {
     nym: receiveSession.node.counters,
     gatewayTraffic: receiveSession.node.describeGatewayTraffic()
   })
-  elementById('receive-progress').style.width = '100%'
-  elementById('receive-subtitle').textContent = 'Decrypting and checking the files.'
+  setReceiveStage('checking')
   try {
     // Torrent files are named item-0000, item-0001 ...; sort to match the decrypted list.
     const torrentFiles = [...torrent.files].sort((left, right) => left.name.localeCompare(right.name))
@@ -1855,23 +2585,34 @@ async function finishDownload (torrent) {
       })
       results.push({ blob: new Blob([plaintext], { type: description.type || 'application/octet-stream' }), verified })
     }
+    if (receiveSession.torrent !== torrent) return
     receiveSession.results = results
     const allVerified = results.every(result => result.verified)
     receiveSession.node.sendControl({ kind: 'complete', infoHash: receiveSession.link.infoHash, linkId: bytesToHex(receiveSession.linkStream.linkIdBytes), recipientId: receiveSession.recipientId, verified: allVerified }, receiveSession.link.senderAddress).catch(() => {})
 
-    setReceiveHeading(allVerified ? 'Ready to save' : 'Integrity check failed', allVerified ? 'Every file was decrypted and matches what the sender shared.' : 'At least one file does not match what the sender shared. Do not trust it.')
-    renderFileRows(elementById('receive-file-list'), receiveSession.files, { verified: results.map(result => result.verified), onSave: saveFile })
-    elementById('save-all').classList.toggle('hidden', results.length < 2)
-    elementById('start-download').classList.add('hidden')
-    elementById('stat-eta').textContent = 'Done'
-    // The 1 s stats timer stopped at 'done', so its last reading is stale; show the final total.
-    elementById('stat-received').textContent = formatBytes(receiveSession.files.reduce((sum, file) => sum + file.size, 0))
-    await new Promise(resolve => receiveSession.client.destroy(resolve))
+    setReceiveHeading(allVerified ? 'Ready to save' : 'Do not trust these files', allVerified ? 'Every file was decrypted and matches what the sender shared.' : '')
+    renderReceivedFiles()
+    if (allVerified) {
+      setReceiveStage('done', { caption: 'Received ' + formatBytes(receiveSession.totalBytes) + ' in ' + formatElapsed(transferSeconds) + '. Save the files before you leave; they exist only in this tab.' })
+    } else {
+      setReceiveStage('failed-check')
+    }
+    await new Promise(resolve => receiveSession.client ? receiveSession.client.destroy(resolve) : resolve())
+    receiveSession.client = null
     diagnostics.info('receive', 'done', { allVerified, totalSeconds: Number(((performance.now() - receiveSession.downloadStartedAt) / 1000).toFixed(1)) })
+    if (allVerified) elementById('save-all').focus({ preventScroll: true })
   } catch (error) {
     diagnostics.error('receive', 'decryption failed', error)
-    showReceiveNotice('error', 'Decryption failed: ' + (error?.message ?? String(error)))
+    setReceiveStage('error', { caption: 'Decryption failed: ' + (error?.message ?? String(error)) })
   }
+}
+
+function renderReceivedFiles () {
+  renderFileRows(elementById('receive-file-list'), receiveSession.files, {
+    verified: receiveSession.results.map(result => result.verified),
+    saved: receiveSession.savedIndexes,
+    onSave: saveFile
+  })
 }
 
 function saveFile (index) {
@@ -1884,6 +2625,8 @@ function saveFile (index) {
   anchor.click()
   anchor.remove()
   setTimeout(() => URL.revokeObjectURL(url), 60000)
+  receiveSession.savedIndexes.add(index)
+  renderReceivedFiles()
 }
 
 async function saveAllFiles () {
@@ -1893,18 +2636,79 @@ async function saveAllFiles () {
   }
 }
 
-function setReceiveHeading (title, subtitle) {
-  elementById('receive-title').textContent = title
-  elementById('receive-subtitle').textContent = subtitle
+function hasUnsavedFiles () {
+  return Boolean(receiveSession.results) && receiveSession.results.some((result, index) => !receiveSession.savedIndexes.has(index))
 }
-function showReceiveNotice (tone, text) {
-  const notice = elementById('receive-notice')
-  notice.dataset.tone = tone
-  elementById('receive-notice-text').textContent = text
-  notice.classList.remove('hidden')
+
+/**
+ * Back, Cancel or Done in the receive view, or the browser's Back button. A download in progress
+ * and verified files not yet saved each ask first. When the browser's Back button started it and
+ * the person chooses to stay, the receive view's history entry is put back.
+ */
+let ignoreNextPopState = false
+async function requestLeaveReceiveView ({ fromHistory = false } = {}) {
+  const stayInView = () => { if (fromHistory) history.pushState({ view: 'receive' }, '', cleanPageUrl()) }
+  if (receiveSession.downloading) {
+    const confirmed = await confirmAction({ title: 'Stop receiving?', message: 'What you have received so far will be discarded, and the sender will be told you cancelled.', confirmLabel: 'Stop receiving', cancelLabel: 'Keep receiving' })
+    if (!confirmed) return stayInView()
+  } else if (receiveSession.stage === 'done' && hasUnsavedFiles()) {
+    const confirmed = await confirmAction({ title: 'Leave without saving?', message: 'The files exist only in this tab. After you leave, the sender would have to share them again.', confirmLabel: 'Leave', cancelLabel: 'Stay' })
+    if (!confirmed) return stayInView()
+  }
+  leaveReceiveView()
+  if (!fromHistory && history.state?.view === 'receive') {
+    ignoreNextPopState = true
+    history.back()
+  }
 }
-function hideReceiveNotice () {
-  elementById('receive-notice').classList.add('hidden')
+
+function leaveReceiveView () {
+  const stage = receiveSession.stage
+  // Tell the sender this recipient is gone, unless the sender already knows or never heard of it.
+  const senderKnowsUs = receiveSession.hellosSent > 0 && !['done', 'failed-check', 'stopped', 'full', 'refused'].includes(stage)
+  if (senderKnowsUs && receiveSession.node && receiveSession.link) {
+    receiveSession.node.sendControl({ kind: 'cancel', infoHash: receiveSession.link.infoHash, recipientId: receiveSession.recipientId, stage: receiveSession.downloading ? 'downloading' : 'before-download' }, receiveSession.link.senderAddress).catch(() => {})
+  }
+  diagnostics.info('receive', 'left the receive view', { stage, toldSender: senderKnowsUs })
+  endReceiverTransfer()
+  clearInterval(receiveSession.uiTimer)
+  Object.assign(receiveSession, createReceiveSessionState(), { token: receiveSession.token + 1 })
+  resetReceiveView()
+  showView('view-choose')
+  noteUserActivity()
+}
+
+// ---------------------------------------------------------------------------
+// Idle disconnect
+// ---------------------------------------------------------------------------
+// A connected tab uses about 0.8 to 2 GB of data an hour even with nothing to send. With nothing
+// in progress (the start page, or a receive view that has ended), the page disconnects after
+// NYM_IDLE_DISCONNECT_MS without activity. A click, a key press, a drag or returning to the tab
+// reconnects on the start page; elsewhere the next action that needs Nym reconnects.
+let idleTimer = null
+function nothingInProgress () {
+  const view = currentView()
+  if (view === 'view-choose') return true
+  if (view === 'view-receive') return RECEIVE_TERMINAL_STAGES.has(receiveSession.stage)
+  return false
+}
+function noteUserActivity () {
+  clearTimeout(idleTimer)
+  idleTimer = setTimeout(disconnectIfIdle, NYM_IDLE_DISCONNECT_MS)
+  if (!nymNodePromise && currentView() === 'view-choose') ensureNymConnected('activity on the start page')
+}
+function disconnectIfIdle () {
+  if (!nymNodePromise) return
+  if (!nothingInProgress()) {
+    idleTimer = setTimeout(disconnectIfIdle, NYM_IDLE_DISCONNECT_MS)
+    return
+  }
+  stopNymNode('no activity for ' + NYM_IDLE_DISCONNECT_MS / 60000 + ' minutes')
+}
+
+// Leaving the page loses a share in progress, a download in progress, or files not yet saved.
+function shouldWarnBeforeLeaving () {
+  return Boolean(sendSession.torrent) || receiveSession.downloading || (receiveSession.stage === 'done' && hasUnsavedFiles())
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,44 +2728,90 @@ function wireUserInterface () {
   })
   fileInput.addEventListener('change', () => startSharing(fileInput.files))
 
-  elementById('privacy-mode').addEventListener('change', event => {
-    diagnostics.info('nym', 'network mode changed', { mode: event.target.value })
-    getNymNode(event.target.value).catch(error => diagnostics.error('nym', 'mode switch failed', error))
+  const modeSelect = elementById('network-mode')
+  modeSelect.addEventListener('change', () => {
+    const mode = modeSelect.value
+    fitSelectToSelection(modeSelect)
+    storeMode(mode)
+    diagnostics.info('nym', 'network mode changed', { mode })
+    getNymNode(mode).catch(error => { if (error?.name !== 'AbortError') diagnostics.error('nym', 'mode switch failed', error) })
   })
 
   elementById('copy-link').addEventListener('click', async () => {
-    const label = elementById('copy-link').querySelector('span')
+    const button = elementById('copy-link')
     try {
       await navigator.clipboard.writeText(elementById('share-link').value)
-      label.textContent = 'Copied'
+      setButtonContent(button, 'check', 'Copied')
     } catch (error) {
       elementById('share-link').select()
-      label.textContent = 'Press Cmd+C'
+      setButtonContent(button, 'copy', /Mac|iPhone|iPad/.test(navigator.userAgent) ? 'Press Cmd+C' : 'Press Ctrl+C')
     }
-    setTimeout(() => { label.textContent = 'Copy' }, 2000)
+    clearTimeout(button.resetTimer)
+    button.resetTimer = setTimeout(() => setButtonContent(button, 'copy', 'Copy link'), 2000)
+  })
+
+  elementById('native-share').addEventListener('click', async () => {
+    try {
+      await navigator.share({ url: elementById('share-link').value })
+    } catch (error) {
+      if (error?.name !== 'AbortError') diagnostics.warn('send', 'share sheet failed', error)
+    }
   })
 
   elementById('toggle-qr').addEventListener('click', async () => {
     const image = elementById('qr-image')
+    const button = elementById('toggle-qr')
     if (!sendSession.qrDataUrl) {
       const { QRCode } = await loadLibraries()
-      sendSession.qrDataUrl = await QRCode.toDataURL(elementById('share-link').value, { errorCorrectionLevel: 'L', margin: 1, width: 400 })
+      sendSession.qrDataUrl = await QRCode.toDataURL(elementById('share-link').value, { errorCorrectionLevel: 'L', margin: 1, width: 440 })
       image.src = sendSession.qrDataUrl
     }
-    image.classList.toggle('hidden')
+    const showing = image.classList.toggle('hidden') === false
+    button.setAttribute('aria-expanded', String(showing))
+    setButtonContent(button, 'qr-code', showing ? 'Hide QR code' : 'Show QR code')
   })
 
-  elementById('stop-sharing').addEventListener('click', () => stopSharing())
+  elementById('stop-sharing').addEventListener('click', () => requestStopSharing())
+  elementById('share-start-over').addEventListener('click', () => stopSharing({ notifyRecipients: false }))
+
+  const pasteInput = elementById('paste-input')
   elementById('paste-form').addEventListener('submit', event => {
     event.preventDefault()
-    elementById('paste-input').setCustomValidity('')
-    openShareLink(elementById('paste-input').value.trim())
+    openShareLink(pasteInput.value.trim())
   })
-  elementById('start-download').addEventListener('click', () => startDownload().catch(error => {
-    diagnostics.error('receive', 'download could not start', error)
-    showReceiveNotice('error', error.message)
-  }))
+  // A pasted link that parses opens straight away; anything else waits for Open.
+  pasteInput.addEventListener('paste', () => setTimeout(() => {
+    const pasted = pasteInput.value.trim()
+    if (parseShareLink(pasted)) openShareLink(pasted)
+  }, 0))
+  pasteInput.addEventListener('input', () => showPasteError(''))
+
+  elementById('receive-back').addEventListener('click', () => requestLeaveReceiveView())
+  elementById('start-download').addEventListener('click', () => requestDownload())
+  elementById('try-again').addEventListener('click', () => retryReceive())
   elementById('save-all').addEventListener('click', () => saveAllFiles())
+
+  window.addEventListener('popstate', event => {
+    if (ignoreNextPopState) {
+      ignoreNextPopState = false
+      return
+    }
+    if (currentView() === 'view-receive' && event.state?.view !== 'receive') {
+      requestLeaveReceiveView({ fromHistory: true })
+    } else if (currentView() !== 'view-receive' && event.state?.view === 'receive') {
+      // Forward to a download that has already ended: there is nothing to return to.
+      history.replaceState({ view: 'choose' }, '', cleanPageUrl())
+    }
+  })
+  window.addEventListener('beforeunload', event => {
+    if (!shouldWarnBeforeLeaving()) return
+    event.preventDefault()
+    event.returnValue = ''
+  })
+  for (const eventName of ['pointerdown', 'keydown', 'dragenter', 'touchstart']) {
+    document.addEventListener(eventName, () => noteUserActivity(), { capture: true, passive: true })
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') noteUserActivity() })
 
   // Diagnostics panel
   elementById('diagnostics').addEventListener('toggle', () => diagnostics.scheduleRender())
@@ -2002,7 +2852,7 @@ function wireUserInterface () {
   })
 }
 
-diagnostics.info('diag', 'page loaded', { session: SESSION_ID, pageVersion: PAGE_VERSION, faultInjection: FAULT_INJECTION_ENABLED })
+diagnostics.info('diag', 'page loaded', { session: SESSION_ID, pageVersion: PAGE_VERSION, faultInjection: FAULT_INJECTION_ENABLED, networkMode: readStoredMode() })
 if (FAULT_INJECTION_ENABLED) {
   // Test controls for recovery. Each action is logged so test logs show exactly what was injected.
   window.nymShareFaults = {
@@ -2029,12 +2879,17 @@ if (FAULT_INJECTION_ENABLED) {
   diagnostics.warn('fault', 'fault injection controls enabled through ?faults=1')
 }
 logEnvironment()
+elementById('network-mode').value = readStoredMode()
+fitSelectToSelection(elementById('network-mode'))
 wireUserInterface()
+updateModeControl()
 renderIcons()
 if (location.hash.length > 1) {
   diagnostics.info('diag', 'link found in address bar; opening receive view')
-  openShareLink(location.href)
+  openShareLink(location.href, { fromAddressBar: true })
 } else {
+  history.replaceState({ view: 'choose' }, '', location.href)
   // Connect while the sender is still choosing files.
-  getNymNode(elementById('privacy-mode').value).catch(error => diagnostics.error('nym', 'initial connection failed', error))
+  ensureNymConnected('page opened')
 }
+noteUserActivity()
