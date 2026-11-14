@@ -26,6 +26,23 @@ The share link carries everything a recipient needs after the `#`: the sender's 
 
 Open the page, drop in files and send the link. The recipient opens the link, or pastes it into the Receive box, and clicks Download. The Diagnostics panel at the bottom keeps a timestamped log that never contains keys, links, file names or full Nym addresses.
 
+## Reliability
+
+- If a Nym gateway connection drops and the Nym client does not restore it within 15 seconds, the page starts a new client with the same keys and the same gateway, so the address in a shared link keeps working. Only if that gateway refuses three reconnects does the page move to a new one, and then the sender sees a new link to send.
+- A recipient that receives no data for 20 seconds opens a new link to the sender. If that brings nothing within 15 seconds, or a link closes early, it checks whether the sender is online every 20 seconds and resumes when the sender answers. Pieces already received are kept.
+- Recipients repeat their first message to the sender until it answers, because messages through the mixnet can be delayed or lost.
+- While sending or receiving, the page asks the browser to keep the screen awake.
+
+## Testing
+
+The Diagnostics panel logs every step, including how long each control message spent in transit. Opening the page with `?faults=1` adds test controls in the browser console:
+
+- `nymShareFaults.dropIncomingData(seconds)` discards all incoming data for that long.
+- `nymShareFaults.closeGatewaySockets()` closes this page's connection to its Nym gateway.
+- `nymShareFaults.replaceNymClient()` replaces the Nym client immediately.
+
+Share links made with `?faults=1` open with the same controls on the recipient's side.
+
 ## Building
 
 ```sh

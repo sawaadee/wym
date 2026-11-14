@@ -385,7 +385,9 @@ function describeReplyTag (senderTag) {
 // Open tabs record a heartbeat in localStorage; on startup, a database is deleted only when
 // no tab has refreshed its heartbeat for a minute, so another live tab's storage is never
 // pulled out from under it.
-const NYM_CONNECT_ATTEMPT_TIMEOUT_MS = 20000
+// Most connects took 5 to 7 s in testing, one took 18.8 s, and attempts cut off at 20 s were
+// followed by retries that connected in 6 to 7 s, so a slow attempt gets 30 s before it is replaced.
+const NYM_CONNECT_ATTEMPT_TIMEOUT_MS = 30000
 const NYM_CONNECT_ATTEMPTS = 3
 // How long the Nym client gets to restore a lost gateway connection on its own before the node
 // replaces it, how long a send waits for a reconnecting client, and the longest pause between
