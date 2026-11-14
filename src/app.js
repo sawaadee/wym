@@ -976,6 +976,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
   // Starts a Nym client under this node's clientId and waits for its gateway connection.
   // Events from a client that has since been replaced are ignored.
   let lastClientStartedAt = 0
+  let stopConnectWait = () => {}
   const startClient = async (purpose, preferredGateway) => {
     if (abortSignal?.aborted) throw createAbortError()
     const generation = ++clientGeneration
@@ -984,7 +985,15 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     lastClientStartedAt = performance.now()
     const candidate = await createNymMixnetClient()
     let connectedAddress = null
-    candidate.events.subscribeToConnected(event => { if (generation === clientGeneration) connectedAddress = event.args.address })
+    // The wait below wakes on the connected event itself, not on a polling timer: a tab in the
+    // background for more than five minutes gets its timers run only once a minute, which made a
+    // 5 s connect look like 28 s and would slow every reconnect of a sharing tab left open.
+    let wakeWait = () => {}
+    candidate.events.subscribeToConnected(event => {
+      if (generation !== clientGeneration) return
+      connectedAddress = event.args.address
+      wakeWait()
+    })
     candidate.events.subscribeToRawMessageReceivedEvent(event => { if (generation === clientGeneration) handleRawMessage(event) })
     candidate.events.subscribeToWymSocketState(event => { if (generation === clientGeneration) handleSocketState(event.args) })
     const startOptions = { clientId, nymApiUrl: NYM_API_URL, forceTls: true }
@@ -1001,13 +1010,24 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     const hardDeadline = attemptStartedWall + NYM_CONNECT_ATTEMPT_MAX_MS
     const currentDeadline = () => Math.min(hardDeadline, Math.max(attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS, lastSocketActivityAt + NYM_CONNECT_ACTIVITY_GRACE_MS))
     let extensionLogged = false
+    const onAbort = () => wakeWait()
+    abortSignal?.addEventListener('abort', onAbort)
     while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration && !abortSignal?.aborted) {
       if (!extensionLogged && Date.now() > attemptStartedWall + NYM_CONNECT_ATTEMPT_TIMEOUT_MS) {
         extensionLogged = true
         diagnostics.info('nym', 'still connecting; the gateway connection is active, so waiting longer', { purpose, waitedMs: Date.now() - attemptStartedWall })
       }
-      await new Promise(resolve => setTimeout(resolve, 200))
+      // Re-check the moving deadline at least once a second; the connected event, an abort or the
+      // node stopping (stopConnectWait) end the wait at once.
+      await new Promise(resolve => {
+        const timer = setTimeout(resolve, Math.max(0, Math.min(1000, currentDeadline() - Date.now())))
+        wakeWait = () => { clearTimeout(timer); resolve() }
+        stopConnectWait = wakeWait
+      })
     }
+    wakeWait = () => {}
+    stopConnectWait = () => {}
+    abortSignal?.removeEventListener('abort', onAbort)
     if (abortSignal?.aborted && !connectedAddress) {
       // The page asked for another mode or went idle while this client was still connecting.
       await shutDownClient(candidate, purpose)
@@ -1160,6 +1180,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null } = {}) {
     flushGatewayTrafficWindow()
     diagnostics.info('nym', 'stopping client', Object.assign({}, node.counters, { gatewayTraffic: node.describeGatewayTraffic() }))
     setState('stopped')
+    stopConnectWait()
     clearTimeout(socketGraceTimer)
     socketGraceTimer = null
     clientGeneration += 1
