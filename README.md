@@ -47,6 +47,24 @@ A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 2
 - Recipients repeat their first message to the sender until it answers, because messages through the mixnet can be delayed or lost.
 - While sending or receiving, the page asks the browser to keep the screen awake.
 
+## Gateway choice and health
+
+Each side connects to the Nym mixnet through one gateway, and a gateway can keep its connection open while delivering almost nothing back. Measured with the page's gateway test (`?gatewaytest=24`, below) on 14 November 2026, with 24 fresh connections across Nym's published score bands:
+
+| Gateway score | Runs | Failed to connect | Broken or slow at connect | Median connect | Median reconnect, same gateway | Median move to a new gateway |
+| --- | --- | --- | --- | --- | --- | --- |
+| below 0.95 | 8 | 1 | 4 | 6.5 s | 3.4 s | 4.7 s |
+| 0.95 to 0.98 | 8 | 0 | 2 | 5.6 s | 3.9 s | 6.7 s |
+| 0.99 and up | 8 | 0 | 2 | 5.8 s | 3.3 s | 5.4 s |
+
+So the page does three things:
+
+- It fetches Nym's gateway list once per page load and picks a gateway at random among those a browser can reach that score at least 0.95 (560 of 580 at the time), never one it already tried. Random choice keeps users of this page spread across the network instead of concentrated on a few gateways.
+- About 8 seconds after connecting, it checks the incoming path two ways. Every packet sent, real or cover, earns an acknowledgement back through the gateway: healthy gateways returned 0.83 to 1.00 per packet sent in that time, broken or slow ones 0.09 to 0.61, so the check needs at least 0.75. And it sends three messages to its own address: healthy gateways returned them in 0.4 to 2.3 seconds, slow ones took 3 to 17 seconds or lost them, so the median must be 3 seconds or less. Afterwards, two 10-second windows in a row below 0.6 acknowledgements per packet also count as a failure.
+- On a failure it moves to another gateway. Before a link exists this is invisible apart from a few seconds of "Reconnecting"; a sender waits for the check to pass before making the link. A recipient moves at once and reopens its link to the sender. A sender whose link is already out first reconnects to the same gateway, which keeps the link working, and only moves (showing the new link) if that does not help. A gateway that has not opened its first connection within 8 seconds is abandoned for another; in testing one slow gateway otherwise made a move take 45 seconds. Each connection changes gateway at most three times.
+
+The connect timeline in the log shows where the 4 to 7 seconds go: fetching the gateway list (about 0.5 s), registering with the gateway (about 2 s, the connection that closes twice), loading the network map from the Nym API (about 1 s), then opening and authenticating the working connection (about 1.7 s). Reconnecting to the same gateway skips registration.
+
 ## Testing
 
 The Diagnostics panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 505 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
@@ -57,6 +75,9 @@ Opening the page with `?faults=1` adds test controls in the browser console:
 - `nymShareFaults.delayIncomingMessages(milliseconds)` holds every incoming message for that long, imitating a slow path. Pass 0 to stop.
 - `nymShareFaults.closeGatewaySockets()` closes this page's connection to its Nym gateway.
 - `nymShareFaults.replaceNymClient()` replaces the Nym client immediately.
+- `nymShareFaults.hideAcknowledgements(seconds)` makes the health check see no acknowledgements for that long, as on a broken gateway, so the page's gateway move can be tested on a working one.
+
+Opening the page with `?gatewaytest=N` (up to 60) runs the gateway test instead of the normal page: N fresh connections in a row, cycling through the score bands above, each recording the gateway's score, the connect timeline, the acknowledgement checks, three round trips to its own address, and the time to reconnect to the same gateway and to move to a new one. Each run takes about a minute and uses about 15 MB of data in Maximum privacy. Results appear in a table on the page, in the log, and in `window.nymShareGatewayTest`.
 
 Share links made with `?faults=1` open with the same controls on the recipient's side.
 
