@@ -52,12 +52,17 @@ import {
 // ---------------------------------------------------------------------------
 const NYM_API_URL = 'https://validator.nymtech.net/api'
 
-// Nym pacing per network mode. "balanced" sends a real packet every 2 ms instead of 20 ms
-// (raw client throughput in the standalone harness: ~55 -> ~120 KB/s). End to end in this
-// page, 1 MB moved at ~43 KB/s Balanced versus ~35 KB/s Maximum once transfers were running,
-// so the transfer is not limited by this setting alone. Per-hop mixing delays stay at Nym's defaults.
+// Nym pacing per network mode. Each tick of the client's main stream sends one packet, real or
+// cover, so this sets the steady packet rate whether or not anything is being sent. "maximum" keeps
+// Nym's default of one packet every 20 ms (with loop cover, 55 a second, about 1.1 Mbps up).
+// "balanced" asks for one every 11 ms: with loop cover about 96 a second, about 1.9 Mbps up, which
+// sits inside the range NymVPN users can choose with its Mixnet Tuning (0.7 to 2 Mbps). It used to
+// ask for 2 ms, which no browser delivered: desktop Brave and Chromium capped it at about 135 a
+// second and Brave with DevTools open at about 66, so the rate on the wire depended on the browser
+// and machine. At 11 ms desktop browsers deliver what is asked. Per-hop mixing delays stay at
+// Nym's defaults in both modes.
 const NYM_CLIENT_OVERRIDES = {
-  balanced: { traffic: { messageSendingAverageDelayMs: 2 } },
+  balanced: { traffic: { messageSendingAverageDelayMs: 11 } },
   maximum: undefined
 }
 
@@ -115,9 +120,10 @@ const MODE_LABELS = { balanced: 'Balanced', maximum: 'Maximum privacy' }
 const MODE_STORAGE_KEY = 'nym-share-network-mode'
 const DEFAULT_MODE = 'balanced'
 // Data used per hour while connected, upload plus download, from gateway traffic measured in
-// Brave and Chromium on macOS (0.5.1): Maximum 1.1 + 0.7 Mbps, Balanced 2.65 + 1.8 Mbps. The share
-// view shows these until this tab has measured its own rate.
-const ESTIMATED_GIGABYTES_PER_HOUR = { balanced: 2.0, maximum: 0.8 }
+// Brave and Chromium on macOS: Maximum 1.1 up + 0.7 down Mbps. Balanced at 11 ms is estimated from
+// its packet rate (96 a second, 1.9 up) with the same download share as measured in both modes
+// (about 0.65 of upload), 1.25 down. The share view shows these until this tab has measured its own rate.
+const ESTIMATED_GIGABYTES_PER_HOUR = { balanced: 1.4, maximum: 0.8 }
 // With nothing to send or receive, the page disconnects from Nym after this long without user
 // activity, and reconnects on the next click, key press or return to the tab.
 const NYM_IDLE_DISCONNECT_MS = 5 * 60 * 1000

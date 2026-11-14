@@ -28,11 +28,11 @@ Open the page, drop in files and send the link. The recipient opens the link, or
 
 ### Network mode
 
-The mode menu at the top applies to the whole page and is remembered in the browser. Balanced asks the Nym client for a packet every 2 ms instead of Nym's default 20 ms; browsers deliver about 135 packets a second (about 2.65 Mbps up), against 55 (about 1.1 Mbps) for Maximum privacy, which uses Nym's defaults. The two sides do not need the same mode: each mode only shapes that side's own traffic. Changing the mode while a client is still connecting cancels it at once instead of waiting for it to finish.
+The mode menu at the top applies to the whole page and is remembered in the browser. Balanced asks the Nym client for a packet every 11 ms instead of Nym's default 20 ms: about 96 packets a second with cover traffic (about 1.9 Mbps up, inside the 0.7 to 2 Mbps range NymVPN users can choose), against 55 (about 1.1 Mbps) for Maximum privacy, which uses Nym's defaults. Balanced used to ask for 2 ms, which no browser delivered: desktop browsers capped it at about 135 a second and Brave with DevTools open at about 66, so its rate depended on the machine. At 11 ms the rate is what was asked for. The two sides do not need the same mode: each mode only shapes that side's own traffic. Changing the mode while a client is still connecting cancels it at once instead of waiting for it to finish.
 
 ### Data use
 
-A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 2 GB in Balanced, even with nothing to send, because the Nym client keeps a steady stream of cover traffic. The share view shows the rate measured on its own connection. With nothing in progress (the start page, or a finished or failed download), the page disconnects after 5 minutes without activity and reconnects on the next click, key press or return to the tab.
+A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 1.4 GB in Balanced, even with nothing to send, because the Nym client keeps a steady stream of cover traffic. The share view shows the rate measured on its own connection. With nothing in progress (the start page, or a finished or failed download), the page disconnects after 5 minutes without activity and reconnects on the next click, key press or return to the tab.
 
 ### Stopping and cancelling
 
@@ -69,7 +69,7 @@ The Nym client itself writes a console line for every message it sends, naming t
 
 ## Testing
 
-The Diagnostics panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 505 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
+The Diagnostics panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 96 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
 
 Opening the page with `?faults=1` adds test controls in the browser console:
 
