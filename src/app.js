@@ -1020,7 +1020,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       firstHealthCheckTimer = setTimeout(async () => {
         const start = await startReading
         const acknowledgementsEnd = await readNow()
-        if (firstCheck !== thisCheck || !start || !packetsEnd || !acknowledgementsEnd) return
+        if (firstCheck !== thisCheck || thisCheck.interrupted || !start || !packetsEnd || !acknowledgementsEnd) return
         const packetsOut = packetsEnd.binaryMessagesOut - start.binaryMessagesOut
         const acknowledgements = faultInjection.hideAcknowledgementsUntil > Date.now() ? 0 : acknowledgementsEnd.acknowledgementsIn - start.acknowledgementsIn
         thisCheck.acknowledgementReturn = packetsOut > 0 ? Math.round(acknowledgements / packetsOut * 100) / 100 : 0
@@ -1032,7 +1032,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
         .then(() => node.probeSelf(HEALTH_PROBE_TIMEOUT_MS))
         .catch(() => null)
     )).then(probeMs => {
-      if (firstCheck !== thisCheck) return
+      if (firstCheck !== thisCheck || thisCheck.interrupted) return
       thisCheck.probeMs = probeMs
       concludeFirstCheck()
     })
@@ -1147,6 +1147,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
         socketGraceTimer = null
         diagnostics.info('nym', 'gateway connection restored by the Nym client', { afterMs: Math.round(performance.now() - socketLostAt) })
         reportNetworkStatus('connected')
+        // Health is judged again only on windows that start after the connection settles, and a
+        // first check cut short by the outage starts over.
+        healthSettledAt = performance.now() + HEALTH_SETTLE_MS
+        if (firstCheck?.interrupted) beginHealthCheck()
       }
       return
     }
@@ -1160,6 +1164,13 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     }
     node.counters.gatewayDisconnects += 1
     socketLostAt = performance.now()
+    // While the connection is down no acknowledgement can come back, which says nothing about the
+    // gateway (the drop may be this device's own network). Seen live: a 15 s outage read as 48%
+    // acknowledgements, the gateway was marked failed for 24 hours and the client moved, changing
+    // its address, just as the original connection came back. No window overlapping the outage is
+    // judged, and a first check in progress is abandoned.
+    healthSettledAt = Infinity
+    if (firstCheck) firstCheck.interrupted = true
     diagnostics.warn('nym', 'gateway connection lost', { code, wasClean, waitingMs: NYM_INTERNAL_RECONNECT_GRACE_MS })
     reportNetworkStatus('reconnecting')
     socketGraceTimer = setTimeout(() => {
