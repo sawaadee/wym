@@ -1,0 +1,10 @@
+{
+  "name": "ip",
+  "version": "3.0.0-nym-share",
+  "description": "Replacement for the ip package, used only by bittorrent-tracker's UDP server code, which Nym Share never runs or bundles. Implements the one function that code calls.",
+  "type": "module",
+  "main": "index.js",
+  "exports": "./index.js",
+  "license": "MIT",
+  "private": true
+}

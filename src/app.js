@@ -81,6 +81,9 @@ const MESSAGE_KIND_CONTROL = 1
 const MESSAGE_KIND_DATA = 2
 const LINK_ID_BYTES = 16
 const DATA_HEADER_BYTES = 1 + LINK_ID_BYTES + 4
+// The furthest ahead of the next expected frame a link buffers: 1024 frames of up to 32 KB is
+// 32 MB at most. In testing, links held at most a few dozen frames.
+const MAX_REORDER_GAP_FRAMES = 1024
 const MAX_NYM_MESSAGE_BYTES = 32768
 // Reply blocks (SURBs) the recipient attaches to each message it sends. The sender answers only
 // through these, so it never learns the recipient's Nym address. Each one carries one reply
@@ -1092,6 +1095,12 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     const payload = event.args.payload
     const senderTag = typeof event.args.senderTag === 'string' ? event.args.senderTag : null
     if (payload[0] === MESSAGE_KIND_DATA) {
+      // A data frame shorter than its header cannot be routed or ordered.
+      if (payload.length < DATA_HEADER_BYTES) {
+        node.counters.unknownMessages += 1
+        diagnostics.warn('nym', 'data frame shorter than its header dropped', { bytes: payload.length })
+        return
+      }
       if (faultInjection.dropIncomingDataUntil > Date.now()) {
         node.counters.faultDroppedFrames += 1
         return
@@ -1629,6 +1638,13 @@ function createLinkStreamClass () {
         this.stats.duplicates += 1
         return
       }
+      // A frame this far ahead is not reordering (healthy links held at most a few dozen frames),
+      // and buffering it would let the other side fill this tab's memory, so the link is closed.
+      if (sequence - this.nextExpectedSequence > MAX_REORDER_GAP_FRAMES) {
+        diagnostics.warn('link', 'frame too far ahead of the stream; closing the link', { link: this.id.slice(9, 17), sequence, nextExpected: this.nextExpectedSequence })
+        this.destroy(new Error('a frame arrived ' + (sequence - this.nextExpectedSequence) + ' frames ahead of the stream'))
+        return
+      }
       this.pendingFrames.set(sequence, frame.slice(DATA_HEADER_BYTES))
       this.stats.maxPending = Math.max(this.stats.maxPending, this.pendingFrames.size)
       while (this.pendingFrames.has(this.nextExpectedSequence)) {
@@ -1747,7 +1763,14 @@ function buildShareLink (fields) {
 function parseShareLink (link) {
   const hashIndex = link.indexOf('#')
   if (hashIndex === -1) return null
-  const parts = decodeURIComponent(link.slice(hashIndex + 1)).split(LINK_SEPARATOR)
+  // A damaged link can hold a broken percent-escape, which decodeURIComponent rejects.
+  let fragment
+  try {
+    fragment = decodeURIComponent(link.slice(hashIndex + 1))
+  } catch (error) {
+    return null
+  }
+  const parts = fragment.split(LINK_SEPARATOR)
   let mode
   if (parts[0] === 'v1' && parts.length === 6) {
     mode = 'balanced'
@@ -1810,6 +1833,11 @@ document.addEventListener('visibilitychange', () => {
 const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null, linkFields: null, recipientViews: new Map(), recipientRows: new Map(), nextRecipientNumber: 1, preparing: false, mode: null }
 const stoppedShareInfoHashes = new Set()
 const FRAMES_AWAITING_LINK_TTL_MS = 60000
+// Frames for a link that has not opened yet are held for a short time only, and only so many:
+// anyone with the link can send to this address, so the holding area is bounded.
+const FRAMES_AWAITING_LINK_MAX_LINKS = 16
+const FRAMES_AWAITING_LINK_MAX_FRAMES = 64
+let framesAwaitingLinkOverflowDrops = 0
 
 function routeSenderFrame (frame, senderTag) {
   const linkIdHex = bytesToHex(frame.subarray(1, 1 + LINK_ID_BYTES))
@@ -1836,6 +1864,13 @@ function routeSenderFrame (frame, senderTag) {
     }
   }
   const entry = sendSession.framesAwaitingLink.get(linkIdHex) ?? { frames: [], firstSeenAt: now }
+  if (entry.frames.length >= FRAMES_AWAITING_LINK_MAX_FRAMES || (entry.frames.length === 0 && sendSession.framesAwaitingLink.size >= FRAMES_AWAITING_LINK_MAX_LINKS)) {
+    framesAwaitingLinkOverflowDrops += 1
+    if (framesAwaitingLinkOverflowDrops === 1 || framesAwaitingLinkOverflowDrops % 100 === 0) {
+      diagnostics.warn('link', 'too many frames waiting for links that have not opened; dropping', { link: linkIdHex.slice(0, 8), framesHeld: entry.frames.length, linksWaiting: sendSession.framesAwaitingLink.size, droppedSoFar: framesAwaitingLinkOverflowDrops })
+    }
+    return
+  }
   if (entry.frames.length === 0) diagnostics.info('link', 'frame arrived before its open message; holding it', { link: linkIdHex.slice(0, 8) })
   entry.frames.push(frame.slice())
   sendSession.framesAwaitingLink.set(linkIdHex, entry)
@@ -2235,6 +2270,10 @@ async function startSharing (fileList) {
   const files = chosen.filter(file => file.size > 0)
   if (files.length === 0) {
     showChooseError(chosen.length === 1 ? 'That file is empty, so there is nothing to send.' : 'Those files are empty, so there is nothing to send.')
+    return
+  }
+  if (files.length > MAX_LINK_FILES) {
+    showChooseError('That is ' + files.length + ' files. A link can carry up to ' + MAX_LINK_FILES + '; put them in a zip file, or send them in parts.')
     return
   }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
@@ -2892,6 +2931,7 @@ async function openShareLink (linkText, { fromAddressBar = false } = {}) {
     // The file list is decrypted locally from the link; no network request is needed.
     const files = JSON.parse(textDecoder.decode(await receiveSession.keychain.decryptMeta(base64UrlToBytes(link.encryptedListB64Url))))
     if (receiveSession.token !== token) return
+    validateFileList(files)
     receiveSession.files = files
     receiveSession.totalBytes = files.reduce((sum, file) => sum + file.size, 0)
     diagnostics.info('receive', 'file list decrypted from link', { files: files.length, fileSizes: files.map(file => file.size), plaintextHashPrefixes: files.map(file => String(file.sha256).slice(0, 8)) })
@@ -2915,6 +2955,29 @@ async function openShareLink (linkText, { fromAddressBar = false } = {}) {
     ? 'Your network mode: ' + ownMode + ', the same as the sender. Each side\'s mode only affects its own connection.'
     : 'Your network mode: ' + ownMode + '. It only affects your own connection; the sender chose ' + MODE_LABELS[link.mode] + ' for theirs.'
   await connectReceiver()
+}
+
+/**
+ * Checks the decrypted file list before anything uses it. Whoever made the link wrote the list,
+ * so it is checked like any outside input: 1 to MAX_LINK_FILES entries, each with a name, a type,
+ * a whole-number size and a SHA-256, and a total within MAX_TOTAL_BYTES, which is also the most a
+ * sender can share. Throws on anything else, which the caller reports as a link that does not work.
+ */
+const MAX_LINK_FILES = 1000
+const MAX_FILE_NAME_CHARACTERS = 1024
+function validateFileList (files) {
+  if (!Array.isArray(files) || files.length === 0 || files.length > MAX_LINK_FILES) throw new Error('the file list is not a list of 1 to ' + MAX_LINK_FILES + ' files')
+  let totalBytes = 0
+  for (const file of files) {
+    const valid = file !== null && typeof file === 'object' &&
+      typeof file.name === 'string' && file.name.length > 0 && file.name.length <= MAX_FILE_NAME_CHARACTERS &&
+      typeof file.type === 'string' && file.type.length <= 255 &&
+      Number.isSafeInteger(file.size) && file.size > 0 &&
+      typeof file.sha256 === 'string' && /^[0-9a-f]{64}$/.test(file.sha256)
+    if (!valid) throw new Error('the file list has an entry without a valid name, type, size and SHA-256')
+    totalBytes += file.size
+  }
+  if (totalBytes > MAX_TOTAL_BYTES) throw new Error('the files total more than ' + formatBytes(MAX_TOTAL_BYTES))
 }
 
 /** Joins Nym (reusing the running client) and asks the sender whether it is online. */

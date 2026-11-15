@@ -190,17 +190,21 @@ const GATEWAY_SOCKET_TRACKING = `
 // every other run of 20 or more letters and digits (which covers base58 keys and reply tags), and
 // every wss:// or https:// host replaced by a placeholder.
 // A run made only of capitalised words with no digits (an error name such as
-// "GatewayConnectionTimeout") is kept, so errors stay readable. Simulated over 2 million random
-// keys each, 1 in 12,000 random 16-byte tags (22 characters) and none of the 32-byte keys
-// (43 to 44 characters) had that shape, and a full Nym address (key.key@key) is always redacted.
+// "GatewayConnectionTimeout") is kept, so errors stay readable, with one exception: a run of
+// base58 characters only, with the length of a base58-encoded 16-byte reply tag (20 to 22
+// characters) or 32-byte key (42 to 44), is always redacted, because about 1 in 12,000 random
+// tags is shaped like capitalised words. A full Nym address (key.key@key) is always redacted.
 const WORKER_CONSOLE_FILTER = `
   // ---- wym patch: console filter ----------------------------------------------------------
   // Runs of any letters and digits, not only base58 ones, so a word containing I, O or l (which
   // base58 leaves out) is judged as one word instead of being cut into fragments.
   const WYM_ADDRESS_PATTERN = /[A-Za-z0-9]{20,}(?:\\.[A-Za-z0-9]{20,})?(?:@[A-Za-z0-9]{20,})?/g;
   const WYM_READABLE_NAME_PATTERN = /^(?:[A-Z][a-z]+)+$/;
+  const WYM_BASE58_PATTERN = /^[1-9A-HJ-NP-Za-km-z]+$/;
+  const WYM_KEY_LENGTHS = new Set([20, 21, 22, 42, 43, 44]);
   const WYM_URL_PATTERN = /\\b(wss?|https?):\\/\\/[^\\s"'\\/]+/g;
   function wymRedactMatch(match) {
+      if (WYM_KEY_LENGTHS.has(match.length) && WYM_BASE58_PATTERN.test(match)) return '[redacted]';
       return WYM_READABLE_NAME_PATTERN.test(match) ? match : '[redacted]';
   }
   function wymRedactText(text) {
