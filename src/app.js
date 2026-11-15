@@ -531,10 +531,15 @@ const HEALTH_SETTLE_MS = 10000
 // testing, one gateway took 21 s to open its first connection (making a move take 45 s), and
 // another registered but never opened its working connection, holding a start for 30 s.
 const GATEWAY_STALL_TIMEOUT_MS = 8000
-// After a failed start (WymStartFailed in build/nym-reply-patch.mjs, for example a network topology
-// that cannot route packets) the next attempt waits this long, so a network-wide problem does not
-// turn into a tight loop of failing starts.
+// A failed start (WymStartFailed in build/nym-reply-patch.mjs) is usually network-wide. Seen live
+// on 15 November 2026: a new Nym epoch began at 00:26:19 UTC while the Nym API still served the
+// node list it built at 00:22:24, so every client started in the next minutes found a mixing layer
+// empty and refused to start. Such failures are retried with pauses that double from
+// NYM_START_FAILURE_RETRY_MS up to NYM_START_FAILURE_RETRY_MAX_MS, for up to
+// NYM_START_FAILURE_RETRY_WINDOW_MS, instead of using up the normal connect attempts in seconds.
 const NYM_START_FAILURE_RETRY_MS = 1000
+const NYM_START_FAILURE_RETRY_MAX_MS = 20000
+const NYM_START_FAILURE_RETRY_WINDOW_MS = 5 * 60 * 1000
 // Every call into the Nym worker is bounded, so a worker that stops answering can never hold a
 // connect, reconnect or mode switch open. Loading the worker compiles about 5 MB of WebAssembly,
 // which takes 1 to 3 s on a phone, so it gets far more room than the other calls.
@@ -1355,7 +1360,8 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
           // An unresponsive new gateway is simply replaced by another one; no need to pause. A client
           // that failed to start pauses briefly in case the cause is network-wide.
           const backoffMs = Math.min(NYM_RECONNECT_MAX_DELAY_MS, 2000 * 2 ** (attempt - 1))
-          const delayMs = keepGateway ? backoffMs : error?.name === 'GatewayUnresponsiveError' ? 0 : error?.name === 'ClientStartError' ? NYM_START_FAILURE_RETRY_MS : backoffMs
+          const startFailureDelayMs = Math.min(NYM_START_FAILURE_RETRY_MAX_MS, NYM_START_FAILURE_RETRY_MS * 2 ** (attempt - 1))
+          const delayMs = keepGateway ? backoffMs : error?.name === 'GatewayUnresponsiveError' ? 0 : error?.name === 'ClientStartError' ? startFailureDelayMs : backoffMs
           diagnostics.warn('nym', 'reconnect attempt ' + attempt + ' failed; next try in ' + delayMs / 1000 + ' s', error)
           reportNetworkStatus('failed')
           await new Promise(resolve => setTimeout(resolve, delayMs))
@@ -1462,6 +1468,15 @@ function createAbortError () {
   return error
 }
 
+/** Waits milliseconds, or less if signal aborts first. */
+function waitUnlessAborted (milliseconds, signal) {
+  return new Promise(resolve => {
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', finish); resolve() }
+    const timer = setTimeout(finish, milliseconds)
+    signal?.addEventListener('abort', finish, { once: true })
+  })
+}
+
 function getNymNode (mode) {
   if (nymNodePromise && nymNodeMode === mode) return nymNodePromise
   const previousPromise = nymNodePromise
@@ -1482,14 +1497,27 @@ function getNymNode (mode) {
     // A fresh client usually reaches a gateway in 3 to 6 s. In testing, one client after a
     // mode switch never connected at all, while the next fresh client connected in 5 s, so
     // a stalled attempt is abandoned and retried with a new client instead of waiting.
-    for (let attempt = 1; ; attempt += 1) {
+    // Failed starts are counted apart from other failures (see NYM_START_FAILURE_RETRY_WINDOW_MS).
+    const firstAttemptAt = Date.now()
+    let otherFailures = 0
+    let startFailures = 0
+    for (;;) {
       if (abortController.signal.aborted) throw createAbortError()
       try {
         return await createNymNode(mode, abortController.signal)
       } catch (error) {
-        if (error?.name === 'AbortError' || attempt >= NYM_CONNECT_ATTEMPTS) throw error
-        diagnostics.warn('nym', 'connection attempt ' + attempt + ' of ' + NYM_CONNECT_ATTEMPTS + ' failed; retrying', error)
-        if (error?.name === 'ClientStartError') await new Promise(resolve => setTimeout(resolve, NYM_START_FAILURE_RETRY_MS))
+        if (error?.name === 'AbortError') throw error
+        if (error?.name === 'ClientStartError') {
+          startFailures += 1
+          const delayMs = Math.min(NYM_START_FAILURE_RETRY_MAX_MS, NYM_START_FAILURE_RETRY_MS * 2 ** (startFailures - 1))
+          if (Date.now() - firstAttemptAt + delayMs > NYM_START_FAILURE_RETRY_WINDOW_MS) throw error
+          diagnostics.warn('nym', 'the Nym client failed to start ' + startFailures + (startFailures === 1 ? ' time' : ' times') + '; retrying in ' + delayMs / 1000 + ' s', { reason: error.message })
+          await waitUnlessAborted(delayMs, abortController.signal)
+          continue
+        }
+        otherFailures += 1
+        if (otherFailures >= NYM_CONNECT_ATTEMPTS) throw error
+        diagnostics.warn('nym', 'connection attempt ' + otherFailures + ' of ' + NYM_CONNECT_ATTEMPTS + ' failed; retrying', error)
       }
     }
   })().then(node => {
