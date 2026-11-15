@@ -20,7 +20,7 @@ The share link carries everything a recipient needs after the `#`: the sender's 
 - Neither side learns the other's IP address. Each side's Nym entry node (gateway) sees that side's IP, but not who it is talking to.
 - The sender never learns the recipient's Nym address. The recipient attaches single-use reply blocks to its messages, and the sender answers only through those. The recipient does learn the sender's Nym address, from the link.
 - The sender's tab has to stay open until recipients finish. There is no cloud copy.
-- Throughput through the mixnet is low. In testing, a transfer spent 15 to 25 seconds on setup, then moved roughly 15 to 25 KB per second.
+- Throughput through the mixnet is low, and the sender's network mode sets it. Measured on 15 November 2026 with 2 MB files: a Maximum privacy sender delivered about 28 KB/s, a Balanced sender about 47 KB/s, after 10 to 16 seconds from pressing Download to the first bytes.
 
 ## Using it
 

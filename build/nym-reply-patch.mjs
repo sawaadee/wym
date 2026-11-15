@@ -93,7 +93,7 @@ const GATEWAY_SOCKET_TRACKING = `
   const wymGatewayTraffic = {
       binaryMessagesOut: 0, binaryBytesOut: 0, textMessagesOut: 0, textBytesOut: 0,
       binaryMessagesIn: 0, binaryBytesIn: 0, textMessagesIn: 0, textBytesIn: 0,
-      acknowledgementsIn: 0
+      acknowledgementsIn: 0, sendsAfterClose: 0
   };
   // When each network step of connecting happened, in milliseconds since this worker started:
   // every fetch (Nym API or other host, path only) and every gateway socket opening, opening and
@@ -138,6 +138,14 @@ const GATEWAY_SOCKET_TRACKING = `
       // instance sees every outgoing message without changing the shared prototype.
       const wymNativeSend = socket.send;
       socket.send = function (data) {
+          // After a gateway connection drops, the client keeps sending on the dead socket (about
+          // 100 times a second) until it is replaced. The browser discards those messages anyway,
+          // but prints an error for each one, so they are dropped here without that console flood
+          // and counted apart, so the traffic figures only count messages that could leave.
+          if (socket.readyState === WymNativeWebSocket.CLOSING || socket.readyState === WymNativeWebSocket.CLOSED) {
+              wymGatewayTraffic.sendsAfterClose += 1;
+              return undefined;
+          }
           if (typeof data === 'string') {
               wymGatewayTraffic.textMessagesOut += 1;
               wymGatewayTraffic.textBytesOut += data.length;
