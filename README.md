@@ -38,6 +38,10 @@ The mode menu at the top applies to the whole page and is remembered in the brow
 
 A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 1.4 GB in Balanced, even with nothing to send, because the Nym client keeps a steady stream of cover traffic. The share view shows the rate measured on its own connection. With nothing in progress (the start page, or a finished or failed download), the page disconnects after 5 minutes without activity and reconnects on the next click, key press or return to the tab.
 
+### Updates
+
+An open tab keeps running the version it loaded, so the page checks whether the site has a newer one: when the tab comes back into view, and every 30 minutes while it stays in view, it reads `version.json` from the same site that served it, with no cookies or referrer. If the site's version is newer, the start page shows a notice with a Reload button. The notice never appears during a share or a download; it waits until the person is back on the start page. Not now hides it until the next version.
+
 ### Stopping and cancelling
 
 - Stop sharing asks first, then tells every recipient who has not finished that sharing stopped, through the reply blocks they sent. A recipient who opens the link later is told the same.
@@ -103,7 +107,7 @@ npm run build
 
 ## Verifying a build
 
-`docs/SHA256SUMS` holds the checksum of `docs/index.html`. The build does not depend on the time or machine it runs on, so anyone can reproduce it:
+`docs/SHA256SUMS` holds the checksum of `docs/index.html`, and `docs/version.json` its version, which the verify step also checks. The build does not depend on the time or machine it runs on, so anyone can reproduce it:
 
 ```sh
 npm ci

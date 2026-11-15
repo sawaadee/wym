@@ -5,7 +5,8 @@
   applies build/nym-reply-patch.mjs to the Nym SDK so replies can use reply blocks and
   build/webtorrent-latency-patch.mjs to WebTorrent so slow mixnet paths do not hit its timeouts,
   inlines the bundle into src/page.html, and writes docs/SHA256SUMS so anyone can check that
-  the page they loaded matches a build from this repository. The output does not depend on
+  the page they loaded matches a build from this repository. It also writes docs/version.json,
+  which an open page reads to offer a reload when the site has a newer version. The output does not depend on
   the time or machine of the build, so running it again from the same commit must reproduce
   the same checksum; pass --check to verify that without writing anything.
   Created: 2026-11-14
@@ -21,6 +22,7 @@ const APP_ENTRY_PATH = 'src/app.js'
 const OUTPUT_DIRECTORY = 'docs'
 const OUTPUT_PAGE_PATH = OUTPUT_DIRECTORY + '/index.html'
 const OUTPUT_CHECKSUM_PATH = OUTPUT_DIRECTORY + '/SHA256SUMS'
+const OUTPUT_VERSION_PATH = OUTPUT_DIRECTORY + '/version.json'
 const SCRIPT_MARKER = '<!-- APP_SCRIPT -->'
 
 const checkOnly = process.argv.includes('--check')
@@ -60,6 +62,7 @@ const pageHtml = pageTemplate.replace(SCRIPT_MARKER, () => '<script type="module
 
 const pageDigest = createHash('sha256').update(pageHtml, 'utf8').digest('hex')
 const checksumFile = pageDigest + '  index.html\n'
+const versionFile = JSON.stringify({ version: packageManifest.version }) + '\n'
 
 if (checkOnly) {
   const committedChecksums = await readFile(OUTPUT_CHECKSUM_PATH, 'utf8').catch(() => '')
@@ -67,11 +70,17 @@ if (checkOnly) {
     console.error('Checksum mismatch.\n  built:     ' + checksumFile.trim() + '\n  committed: ' + (committedChecksums.trim() || '(none)'))
     process.exit(1)
   }
+  const committedVersion = await readFile(OUTPUT_VERSION_PATH, 'utf8').catch(() => '')
+  if (committedVersion !== versionFile) {
+    console.error(OUTPUT_VERSION_PATH + ' does not match package.json: ' + (committedVersion.trim() || '(none)'))
+    process.exit(1)
+  }
   console.log('Reproduced ' + OUTPUT_PAGE_PATH + ' exactly: ' + pageDigest)
 } else {
   await mkdir(OUTPUT_DIRECTORY, { recursive: true })
   await writeFile(OUTPUT_PAGE_PATH, pageHtml, 'utf8')
   await writeFile(OUTPUT_CHECKSUM_PATH, checksumFile, 'utf8')
+  await writeFile(OUTPUT_VERSION_PATH, versionFile, 'utf8')
   const sizeMegabytes = (Buffer.byteLength(pageHtml, 'utf8') / 1e6).toFixed(2)
   console.log('Wrote ' + OUTPUT_PAGE_PATH + ' (' + sizeMegabytes + ' MB), sha256 ' + pageDigest)
 }

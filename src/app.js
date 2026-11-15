@@ -41,12 +41,14 @@ import {
   Lock as LockIcon,
   Music as MusicIcon,
   QrCode as QrCodeIcon,
+  RefreshCw as RefreshCwIcon,
   RotateCw as RotateCwIcon,
   Share as ShareIcon,
   ShieldCheck as ShieldCheckIcon,
   TriangleAlert as TriangleAlertIcon,
   Upload as UploadIcon,
-  UserRound as UserRoundIcon
+  UserRound as UserRoundIcon,
+  X as XIcon
 } from 'lucide'
 
 // PAGE_VERSION is replaced at build time with the version in package.json.
@@ -388,12 +390,14 @@ const PAGE_ICONS = {
   Lock: LockIcon,
   Music: MusicIcon,
   QrCode: QrCodeIcon,
+  RefreshCw: RefreshCwIcon,
   RotateCw: RotateCwIcon,
   Share: ShareIcon,
   ShieldCheck: ShieldCheckIcon,
   TriangleAlert: TriangleAlertIcon,
   Upload: UploadIcon,
-  UserRound: UserRoundIcon
+  UserRound: UserRoundIcon,
+  X: XIcon
 }
 function renderIcons () {
   try {
@@ -1849,7 +1853,83 @@ function showView (viewId) {
   for (const id of VIEW_IDS) elementById(id).classList.toggle('hidden', id !== viewId)
   updateModeControl()
   updateDocumentTitle()
+  renderUpdateNotice()
   if (changed) window.scrollTo({ top: 0 })
+}
+
+// ---------------------------------------------------------------------------
+// Update notice
+// ---------------------------------------------------------------------------
+// An open tab keeps running the code it loaded: in one log, a tab opened at 14:16 was still
+// running 0.5.3 ten hours and several releases later. The page reads version.json, which
+// build.mjs writes next to index.html, from the same site that served the page, and offers a
+// reload when the site has a newer version. The request carries nothing but the browser's own
+// headers (no cookies, no referrer) to a host that already served this page. The notice only
+// appears on the start page, so a share or download in progress is never interrupted; it
+// appears when the person returns there. Checks run when the tab comes back into view and every
+// UPDATE_CHECK_INTERVAL_MS while it stays in view, never more often than that.
+const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000
+const UPDATE_CHECK_POLL_MS = 5 * 60 * 1000
+const UPDATE_CHECK_TIMEOUT_MS = 10000
+// The page was fetched just now, so the first check waits a full interval.
+const updateState = { availableVersion: null, dismissedVersion: null, lastCheckedAt: Date.now(), checking: false }
+
+/** Compares two x.y.z versions: negative, zero or positive. */
+function compareVersions (left, right) {
+  const leftParts = String(left).split('.').map(Number)
+  const rightParts = String(right).split('.').map(Number)
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (leftParts[index] || 0) - (rightParts[index] || 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+async function checkForUpdate (reason) {
+  if (updateState.checking || document.visibilityState !== 'visible') return
+  if (Date.now() - updateState.lastCheckedAt < UPDATE_CHECK_INTERVAL_MS) return
+  updateState.checking = true
+  updateState.lastCheckedAt = Date.now()
+  const abortController = new AbortController()
+  const timer = setTimeout(() => abortController.abort(), UPDATE_CHECK_TIMEOUT_MS)
+  try {
+    const response = await fetch(new URL('version.json', location.href), { cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: abortController.signal })
+    if (!response.ok) throw new Error('the site answered ' + response.status)
+    const { version } = await response.json()
+    if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) throw new Error('unexpected version format')
+    if (compareVersions(version, PAGE_VERSION) > 0 && updateState.availableVersion !== version) {
+      updateState.availableVersion = version
+      diagnostics.info('update', 'a newer version is available', { current: PAGE_VERSION, available: version, reason })
+    }
+  } catch (error) {
+    // Offline or the site unreachable: nothing to show, and the next check tries again.
+    diagnostics.info('update', 'version check failed', { reason, error })
+  } finally {
+    clearTimeout(timer)
+    updateState.checking = false
+    renderUpdateNotice()
+  }
+}
+
+function renderUpdateNotice () {
+  const version = updateState.availableVersion
+  const visible = Boolean(version) && version !== updateState.dismissedVersion && currentView() === 'view-choose'
+  const banner = elementById('update-banner')
+  if (visible) elementById('update-text').textContent = 'Version ' + version + ' of Nym Share is available.'
+  banner.classList.toggle('hidden', !visible)
+}
+
+function wireUpdateNotice () {
+  elementById('update-reload').addEventListener('click', () => {
+    diagnostics.info('update', 'reloading for the newer version', { current: PAGE_VERSION, available: updateState.availableVersion })
+    location.reload()
+  })
+  elementById('update-dismiss').addEventListener('click', () => {
+    updateState.dismissedVersion = updateState.availableVersion
+    renderUpdateNotice()
+  })
+  document.addEventListener('visibilitychange', () => checkForUpdate('tab shown'))
+  setInterval(() => checkForUpdate('timer'), UPDATE_CHECK_POLL_MS)
 }
 
 /** Replaces a container's icon. className is added to the generated svg (for example "spin"). */
@@ -3890,6 +3970,7 @@ logEnvironment()
 elementById('network-mode').value = readStoredMode()
 fitSelectToSelection(elementById('network-mode'))
 wireUserInterface()
+wireUpdateNotice()
 updateModeControl()
 renderIcons()
 elementById('diagnostics').classList.toggle('hidden', !DIAGNOSTICS_VISIBLE)
