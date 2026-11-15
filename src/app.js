@@ -1832,6 +1832,9 @@ document.addEventListener('visibilitychange', () => {
 // page stopped; a recipient still asking about one is told it stopped.
 const sendSession = { torrent: null, client: null, node: null, links: new Map(), framesAwaitingLink: new Map(), closedLinkIds: new Set(), lateFramesDropped: 0, recipients: new Map(), finished: new Set(), recipientLimit: 5, statsTimer: null, stopSnapshots: null, qrDataUrl: null, linkFields: null, recipientViews: new Map(), recipientRows: new Map(), nextRecipientNumber: 1, preparing: false, mode: null }
 const stoppedShareInfoHashes = new Set()
+// The recipient-limit menu's values (0 means anyone with the link) and its default.
+const RECIPIENT_LIMIT_CHOICES = new Set([0, 1, 5, 10])
+const DEFAULT_RECIPIENT_LIMIT = 5
 const FRAMES_AWAITING_LINK_TTL_MS = 60000
 // Frames for a link that has not opened yet are held for a short time only, and only so many:
 // anyone with the link can send to this address, so the holding area is bounded.
@@ -2044,10 +2047,32 @@ function confirmAction ({ title, message, confirmLabel, cancelLabel }) {
   elementById('confirm-accept').textContent = confirmLabel
   elementById('confirm-cancel').textContent = cancelLabel
   dialog.returnValue = ''
+  // The answer is taken from the button pressed (or Escape) directly. Chrome delivers a dialog's
+  // close event while drawing the next frame, so in a tab that is not being drawn (seen in a
+  // background tab in testing) the close event never arrived and the choice was lost.
+  const acceptButton = elementById('confirm-accept')
+  const cancelButton = elementById('confirm-cancel')
   return new Promise(resolve => {
-    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'accept'), { once: true })
+    let settled = false
+    const settle = accepted => {
+      if (settled) return
+      settled = true
+      acceptButton.removeEventListener('click', onAccept)
+      cancelButton.removeEventListener('click', onCancel)
+      dialog.removeEventListener('cancel', onCancel)
+      dialog.removeEventListener('close', onClose)
+      if (dialog.open) dialog.close(accepted ? 'accept' : 'cancel')
+      resolve(accepted)
+    }
+    const onAccept = () => settle(true)
+    const onCancel = () => settle(false)
+    const onClose = () => settle(dialog.returnValue === 'accept')
+    acceptButton.addEventListener('click', onAccept)
+    cancelButton.addEventListener('click', onCancel)
+    dialog.addEventListener('cancel', onCancel)
+    dialog.addEventListener('close', onClose)
     dialog.showModal()
-    elementById('confirm-cancel').focus()
+    cancelButton.focus()
   })
 }
 
@@ -2284,7 +2309,10 @@ async function startSharing (fileList) {
   showChooseError(files.length < chosen.length ? 'Empty files were left out.' : '')
 
   sendSession.preparing = true
-  sendSession.recipientLimit = Number(elementById('recipient-limit').value)
+  // Only the menu's own values are accepted; anything else falls back to the default instead of
+  // to "anyone with the link".
+  const chosenLimit = Number(elementById('recipient-limit').value)
+  sendSession.recipientLimit = elementById('recipient-limit').value !== '' && RECIPIENT_LIMIT_CHOICES.has(chosenLimit) ? chosenLimit : DEFAULT_RECIPIENT_LIMIT
   const mode = currentMode()
   const shareStartedAt = performance.now()
   diagnostics.info('send', 'sharing started', { files: files.length, plaintextBytes: totalBytes, fileSizes: files.map(file => file.size), recipientLimit: sendSession.recipientLimit || 'none', mode })
@@ -2762,7 +2790,7 @@ const RECEIVE_STAGE_DISPLAY = {
   'failed-check': { tone: 'error', icon: 'circle-alert', text: 'A file failed the integrity check', caption: 'At least one file does not match what the sender shared. Do not trust it.', progress: null },
   unreachable: { tone: 'error', icon: 'circle-alert', text: 'The sender is not answering', caption: "Links only work while the sender keeps their tab open. Their tab may be closed, asleep or offline.", progress: null },
   stopped: { tone: 'neutral', icon: 'circle-slash', text: 'The sender stopped sharing', caption: 'Ask them for a new link if you still need the files.', progress: null },
-  full: { tone: 'neutral', icon: 'circle-slash', text: 'This share is full', caption: 'The sender limited how many people can download, and that limit has been reached.', progress: null },
+  full: { tone: 'neutral', icon: 'circle-slash', text: 'This share is full', caption: 'The sender limited how many people can download, and that limit has been reached. A place opens if someone cancels, so you can try again later.', progress: null },
   refused: { tone: 'neutral', icon: 'circle-slash', text: 'The sender refused the connection', caption: '', progress: null },
   'invalid-link': { tone: 'error', icon: 'circle-alert', text: 'This link does not work', caption: 'The key in the link could not decrypt the file list. Check that the whole link was copied.', progress: null },
   error: { tone: 'error', icon: 'circle-alert', text: 'Something went wrong', caption: '', progress: null }
@@ -2770,7 +2798,8 @@ const RECEIVE_STAGE_DISPLAY = {
 // Stages in which nothing is in progress: the page may disconnect from Nym after a while.
 const RECEIVE_TERMINAL_STAGES = new Set(['done', 'failed-check', 'unreachable', 'stopped', 'full', 'refused', 'invalid-link', 'error'])
 // Stages from which Try again starts over.
-const RECEIVE_RETRY_STAGES = new Set(['unreachable', 'lost', 'error'])
+// A full share can open up again when a recipient cancels, so it can be retried too.
+const RECEIVE_RETRY_STAGES = new Set(['unreachable', 'lost', 'error', 'full'])
 
 function setReceiveStage (stage, { caption = null, keepTimer = false } = {}) {
   if (receiveSession.stage !== stage) {
