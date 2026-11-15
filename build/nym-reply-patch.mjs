@@ -18,7 +18,8 @@
   gateway, telling acknowledgements apart from full packets (wymGatewayTraffic()), records when
   each network step of a connect happens (wymConnectTimeline()), exposes wymCloseGatewaySockets()
   for fault-injection tests, keeps the client's own console output from naming Nym addresses or
-  gateway hosts (WORKER_CONSOLE_FILTER), and
+  gateway hosts (WORKER_CONSOLE_FILTER), posts a WymStartFailed event when the client fails to
+  start (the SDK only logs it), and
   returns terminate() from createNymMixnetClient so a replaced client's worker can be ended.
 
   The worker source is decoded and re-encoded as Latin-1 so every byte outside the patched
@@ -186,14 +187,40 @@ const GATEWAY_SOCKET_TRACKING = `
 // browser console and in anything copied from it, and on a large transfer it prints a line per
 // frame. The page's own diagnostics log never records either. This filter drops the client's
 // routine output (log, info, debug, trace) and keeps warnings and errors, with every Nym address,
-// base58 key or tag of 20 characters or more, and wss:// or https:// host replaced by a placeholder.
+// every other run of 20 or more letters and digits (which covers base58 keys and reply tags), and
+// every wss:// or https:// host replaced by a placeholder.
+// A run made only of capitalised words with no digits (an error name such as
+// "GatewayConnectionTimeout") is kept, so errors stay readable. Simulated over 2 million random
+// keys each, 1 in 12,000 random 16-byte tags (22 characters) and none of the 32-byte keys
+// (43 to 44 characters) had that shape, and a full Nym address (key.key@key) is always redacted.
 const WORKER_CONSOLE_FILTER = `
   // ---- wym patch: console filter ----------------------------------------------------------
-  const WYM_ADDRESS_PATTERN = /[1-9A-HJ-NP-Za-km-z]{20,}(?:\\.[1-9A-HJ-NP-Za-km-z]{20,})?(?:@[1-9A-HJ-NP-Za-km-z]{20,})?/g;
+  // Runs of any letters and digits, not only base58 ones, so a word containing I, O or l (which
+  // base58 leaves out) is judged as one word instead of being cut into fragments.
+  const WYM_ADDRESS_PATTERN = /[A-Za-z0-9]{20,}(?:\\.[A-Za-z0-9]{20,})?(?:@[A-Za-z0-9]{20,})?/g;
+  const WYM_READABLE_NAME_PATTERN = /^(?:[A-Z][a-z]+)+$/;
   const WYM_URL_PATTERN = /\\b(wss?|https?):\\/\\/[^\\s"'\\/]+/g;
+  function wymRedactMatch(match) {
+      return WYM_READABLE_NAME_PATTERN.test(match) ? match : '[redacted]';
+  }
+  function wymRedactText(text) {
+      return text.replace(WYM_URL_PATTERN, '$1://[host]').replace(WYM_ADDRESS_PATTERN, wymRedactMatch);
+  }
+  // Errors and other objects are turned into redacted text, because the browser console would
+  // otherwise print their messages and fields as they are.
   function wymRedact(value) {
-      if (typeof value !== 'string') return value;
-      return value.replace(WYM_URL_PATTERN, '$1://[host]').replace(WYM_ADDRESS_PATTERN, '[redacted]');
+      if (typeof value === 'string') return wymRedactText(value);
+      if (value instanceof Error) return wymRedactText((value.name || 'Error') + ': ' + value.message);
+      if (value !== null && typeof value === 'object') {
+          try { return wymRedactText(JSON.stringify(value).slice(0, 2000)); } catch (error) { return '[unprintable object]'; }
+      }
+      return value;
+  }
+  // Describes why the client failed to start, redacted, for the page (see WymStartFailed).
+  function wymDescribeStartFailure(failure) {
+      if (typeof failure === 'string') return wymRedactText(failure).slice(0, 300);
+      if (failure instanceof Error) return wymRedactText((failure.name || 'Error') + ': ' + failure.message).slice(0, 300);
+      return 'unknown error';
   }
   const wymNativeConsole = { warn: console.warn.bind(console), error: console.error.bind(console) };
   ['log', 'info', 'debug', 'trace'].forEach(function (method) { console[method] = function () {}; });
@@ -239,6 +266,16 @@ const WORKER_EDITS = [
     'args: { payload: message, senderTag: senderTag },\n                              });\n',
     'args: { payload: message, senderTag: senderTag },\n                              });\n                              return [2 /*return*/];\n'
   ],
+  // The SDK only logs a failed start (for example when the network topology the client fetched
+  // cannot route packets), so the page waited for its 8 s stall limit to notice. The failure is
+  // now also posted to the page as a WymStartFailed event with a redacted description.
+  [
+    "startHandler(config).catch(function (e) { return console.error('[Nym WASM client] Failed to start', e); });",
+    'startHandler(config).catch(function (e) {\n' +
+    "                  self.postMessage({ kind: 'WymStartFailed', args: { reason: wymDescribeStartFailure(e) } });\n" +
+    "                  return console.error('[Nym WASM client] Failed to start', e);\n" +
+    '              });'
+  ],
   [
     '          rawSend: function (args) {',
     '          rawReply: function (args) {\n' +
@@ -270,7 +307,7 @@ const WORKER_EDITS = [
 const MAIN_THREAD_EDITS = [
   [
     '        subscribeToRawMessageReceivedEvent: (handler) => addSubscription(EventKinds.RawMessageReceived, handler),\n    };',
-    "        subscribeToRawMessageReceivedEvent: (handler) => addSubscription(EventKinds.RawMessageReceived, handler),\n        subscribeToWymSocketState: (handler) => addSubscription('WymSocketState', handler),\n    };"
+    "        subscribeToRawMessageReceivedEvent: (handler) => addSubscription(EventKinds.RawMessageReceived, handler),\n        subscribeToWymSocketState: (handler) => addSubscription('WymSocketState', handler),\n        subscribeToWymStartFailed: (handler) => addSubscription('WymStartFailed', handler),\n    };"
   ],
   [
     '    return {\n        client,\n        events,\n    };',

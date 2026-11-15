@@ -27,14 +27,19 @@ import {
   Copy as CopyIcon,
   Download as DownloadIcon,
   Eraser as EraserIcon,
+  Eye as EyeIcon,
   EyeOff as EyeOffIcon,
   File as FileIcon,
   FileDown as FileDownIcon,
+  FileText as FileTextIcon,
+  Film as FilmIcon,
   Gauge as GaugeIcon,
   Hourglass as HourglassIcon,
+  Image as ImageIcon,
   Info as InfoIcon,
   LoaderCircle as LoaderCircleIcon,
   Lock as LockIcon,
+  Music as MusicIcon,
   QrCode as QrCodeIcon,
   RotateCw as RotateCwIcon,
   Share as ShareIcon,
@@ -100,8 +105,14 @@ const RECIPIENT_ID_PATTERN = /^[0-9a-f]{32}$/
 
 // Fault injection for testing recovery, enabled only when the page is opened with ?faults=1.
 // It adds window.nymShareFaults; nothing else changes.
-const FAULT_INJECTION_ENABLED = new URLSearchParams(location.search).get('faults') === '1'
-const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0, stallConnects: 0, rememberFaultFailures: false }
+const PAGE_PARAMETERS = new URLSearchParams(location.search)
+const FAULT_INJECTION_ENABLED = PAGE_PARAMETERS.get('faults') === '1'
+// The Diagnostics panel is for testing, so it only appears with ?debug=1, or with the test modes
+// (?faults=1, ?gatewaytest=N) that rely on it. The log is kept either way, in memory only.
+const DIAGNOSTICS_VISIBLE = PAGE_PARAMETERS.get('debug') === '1' || FAULT_INJECTION_ENABLED || PAGE_PARAMETERS.has('gatewaytest')
+// A well-formed base58 identity of 32 bytes that belongs to no gateway (all ones decode to zero bytes).
+const FAULT_UNKNOWN_GATEWAY_IDENTITY = '11111111111111111111111111111111'
+const faultInjection = { dropIncomingDataUntil: 0, incomingDelayMs: 0, hideAcknowledgementsUntil: 0, stallConnects: 0, failStarts: 0, rememberFaultFailures: false }
 const PIECE_LENGTH_BYTES = 65536
 const MAX_TOTAL_BYTES = 500 * 1000 * 1000 // everything is held in memory on both sides
 const SENDER_REPLY_TIMEOUT_MS = 60000
@@ -363,14 +374,19 @@ const PAGE_ICONS = {
   Copy: CopyIcon,
   Download: DownloadIcon,
   Eraser: EraserIcon,
+  Eye: EyeIcon,
   EyeOff: EyeOffIcon,
   File: FileIcon,
   FileDown: FileDownIcon,
+  FileText: FileTextIcon,
+  Film: FilmIcon,
   Gauge: GaugeIcon,
   Hourglass: HourglassIcon,
+  Image: ImageIcon,
   Info: InfoIcon,
   LoaderCircle: LoaderCircleIcon,
   Lock: LockIcon,
+  Music: MusicIcon,
   QrCode: QrCodeIcon,
   RotateCw: RotateCwIcon,
   Share: ShareIcon,
@@ -515,11 +531,46 @@ const HEALTH_SETTLE_MS = 10000
 // testing, one gateway took 21 s to open its first connection (making a move take 45 s), and
 // another registered but never opened its working connection, holding a start for 30 s.
 const GATEWAY_STALL_TIMEOUT_MS = 8000
+// After a failed start (WymStartFailed in build/nym-reply-patch.mjs, for example a network topology
+// that cannot route packets) the next attempt waits this long, so a network-wide problem does not
+// turn into a tight loop of failing starts.
+const NYM_START_FAILURE_RETRY_MS = 1000
+// Every call into the Nym worker is bounded, so a worker that stops answering can never hold a
+// connect, reconnect or mode switch open. Loading the worker compiles about 5 MB of WebAssembly,
+// which takes 1 to 3 s on a phone, so it gets far more room than the other calls.
+const NYM_WORKER_LOAD_TIMEOUT_MS = 30000
+const NYM_WORKER_CALL_TIMEOUT_MS = 10000
+const NYM_WORKER_STOP_TIMEOUT_MS = 3000
 const NYM_STORAGE_PREFIX = 'wasm-client-storage-'
 const NYM_CLIENT_ID_PREFIX = 'nym-share-'
 const CLIENT_HEARTBEAT_KEY = 'nym-share-live-clients'
 const CLIENT_HEARTBEAT_INTERVAL_MS = 10000
 const CLIENT_HEARTBEAT_STALE_MS = 60000
+
+/**
+ * Resolves or rejects like promise, or rejects with a TimeoutError after timeoutMs.
+ * onLateResult(value) runs if the promise resolves after the timeout, so a resource it hands
+ * back late (a Nym worker, for example) can still be released.
+ */
+function withTimeout (promise, timeoutMs, description, onLateResult) {
+  let timedOut = false
+  let timer = null
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true
+      const error = new Error(description + ' took longer than ' + timeoutMs / 1000 + ' s.')
+      error.name = 'TimeoutError'
+      reject(error)
+    }, timeoutMs)
+  })
+  const settled = promise.then(value => {
+    if (timedOut && onLateResult) onLateResult(value)
+    return value
+  })
+  // A rejection after the timeout has nobody waiting for it; keep it out of the console.
+  settled.catch(() => {})
+  return Promise.race([settled, timeout]).finally(() => clearTimeout(timer))
+}
 
 function readClientHeartbeats () {
   try {
@@ -842,7 +893,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     gatewayTrafficSampleInFlight = true
     const generation = clientGeneration
     try {
-      const reading = await mixnetClient.client.wymGatewayTraffic()
+      const reading = await withTimeout(mixnetClient.client.wymGatewayTraffic(), NYM_WORKER_CALL_TIMEOUT_MS, 'reading gateway traffic')
       if (generation !== clientGeneration || node.state !== 'connected') return
       const messageCounts = node.counters.dataFramesIn + node.counters.dataFramesOut + node.counters.controlIn + node.counters.controlOut
       const baseline = gatewayTrafficBaseline
@@ -870,6 +921,11 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       if (gatewayTrafficWindow.totals.milliseconds >= logAfterMs) flushGatewayTrafficWindow()
     } catch (error) {
       diagnostics.warn('wire', 'gateway traffic sample failed', error)
+      // A worker that cannot answer a counter read within the limit is stuck, and a stuck worker
+      // also stops every send and the health check itself, so its client is replaced.
+      if (error?.name === 'TimeoutError' && generation === clientGeneration && node.state === 'connected') {
+        node.reconnect('the Nym worker stopped answering')
+      }
     } finally {
       gatewayTrafficSampleInFlight = false
     }
@@ -1094,8 +1150,14 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     }, NYM_INTERNAL_RECONNECT_GRACE_MS)
   }
 
+  // A worker that no longer answers would leave stop() pending forever, so stop gets
+  // NYM_WORKER_STOP_TIMEOUT_MS and the worker is terminated either way.
   const shutDownClient = async (client, purpose) => {
-    try { await client.client.stop?.() } catch (error) { diagnostics.warn('nym', 'client stop failed', { purpose, error }) }
+    try {
+      await withTimeout(Promise.resolve(client.client.stop?.()), NYM_WORKER_STOP_TIMEOUT_MS, 'stopping the Nym client')
+    } catch (error) {
+      diagnostics.warn('nym', 'client stop failed', { purpose, error })
+    }
     try { client.terminate?.() } catch (error) { diagnostics.warn('nym', 'worker terminate failed', { purpose, error }) }
   }
 
@@ -1109,7 +1171,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     const attemptStartedAt = performance.now()
     const { createNymMixnetClient } = await loadLibraries()
     lastClientStartedAt = performance.now()
-    const candidate = await createNymMixnetClient()
+    // A worker that loads after the time limit is ended as soon as it appears.
+    const candidate = await withTimeout(createNymMixnetClient(), NYM_WORKER_LOAD_TIMEOUT_MS, 'loading the Nym client', lateClient => {
+      try { lateClient.terminate?.() } catch (error) { diagnostics.warn('nym', 'late worker terminate failed', { purpose, error }) }
+    })
     // Test only (?faults=1): this attempt sees none of its gateway's events, as if it had stalled.
     const stallThisAttempt = faultInjection.stallConnects > 0
     if (stallThisAttempt) faultInjection.stallConnects -= 1
@@ -1131,11 +1196,24 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       handleSocketState(event.args)
       wakeWait()
     })
+    // The client failed to start (see WymStartFailed): end the wait at once instead of after the
+    // stall limit. The reason is already redacted by the worker.
+    let startFailureReason = null
+    candidate.events.subscribeToWymStartFailed(event => {
+      if (generation !== clientGeneration || stallThisAttempt) return
+      startFailureReason = String(event.args?.reason ?? 'unknown error')
+      wakeWait()
+    })
     const startOptions = { clientId, nymApiUrl: NYM_API_URL, forceTls: true }
     if (NYM_CLIENT_OVERRIDES[mode]) startOptions.clientOverride = NYM_CLIENT_OVERRIDES[mode]
     if (preferredGateway) startOptions.preferredGateway = preferredGateway
+    // Test only (?faults=1): ask for a gateway that does not exist, so the client fails to start.
+    if (faultInjection.failStarts > 0) {
+      faultInjection.failStarts -= 1
+      startOptions.preferredGateway = FAULT_UNKNOWN_GATEWAY_IDENTITY
+    }
     try {
-      await candidate.client.start(startOptions)
+      await withTimeout(candidate.client.start(startOptions), NYM_WORKER_CALL_TIMEOUT_MS, 'starting the Nym client')
     } catch (error) {
       await shutDownClient(candidate, purpose)
       throw error
@@ -1149,7 +1227,7 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     abortSignal?.addEventListener('abort', onAbort)
     let gatewayUnresponsive = false
     const stalledAt = () => Math.max(attemptStartedWall, lastGatewayEventAt) + GATEWAY_STALL_TIMEOUT_MS
-    while (!connectedAddress && Date.now() < currentDeadline() && generation === clientGeneration && !abortSignal?.aborted) {
+    while (!connectedAddress && !startFailureReason && Date.now() < currentDeadline() && generation === clientGeneration && !abortSignal?.aborted) {
       if (Date.now() >= stalledAt()) {
         gatewayUnresponsive = true
         break
@@ -1179,6 +1257,15 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
       // The node was stopped while this client was connecting; do not leave it running.
       await shutDownClient(candidate, purpose)
       throw new Error('The Nym client was stopped while connecting.')
+    }
+    if (startFailureReason && !connectedAddress) {
+      // Not remembered as a gateway failure: the one case seen live was a topology the client
+      // could not route through, and the next gateway connected normally.
+      diagnostics.warn('nym', 'the Nym client failed to start; trying another gateway', { purpose, gateway: preferredGateway ? preferredGateway.slice(0, 6) + '...' : 'chosen by the Nym client', reason: startFailureReason, afterMs: Date.now() - attemptStartedWall })
+      await shutDownClient(candidate, purpose)
+      const error = new Error('The Nym client failed to start: ' + startFailureReason)
+      error.name = 'ClientStartError'
+      throw error
     }
     if (gatewayUnresponsive) {
       const gatewayToBlame = lastGatewayEventAt > 0 || gatewayDirectory.connectedThisPage
@@ -1265,8 +1352,10 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
           try { node.onReconnected?.({ sameAddress }) } catch (error) { diagnostics.error('nym', 'reconnect handler failed', error) }
           return true
         } catch (error) {
-          // An unresponsive new gateway is simply replaced by another one; no need to pause.
-          const delayMs = !keepGateway && error?.name === 'GatewayUnresponsiveError' ? 0 : Math.min(NYM_RECONNECT_MAX_DELAY_MS, 2000 * 2 ** (attempt - 1))
+          // An unresponsive new gateway is simply replaced by another one; no need to pause. A client
+          // that failed to start pauses briefly in case the cause is network-wide.
+          const backoffMs = Math.min(NYM_RECONNECT_MAX_DELAY_MS, 2000 * 2 ** (attempt - 1))
+          const delayMs = keepGateway ? backoffMs : error?.name === 'GatewayUnresponsiveError' ? 0 : error?.name === 'ClientStartError' ? NYM_START_FAILURE_RETRY_MS : backoffMs
           diagnostics.warn('nym', 'reconnect attempt ' + attempt + ' failed; next try in ' + delayMs / 1000 + ' s', error)
           reportNetworkStatus('failed')
           await new Promise(resolve => setTimeout(resolve, delayMs))
@@ -1288,7 +1377,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     try {
       await waitUntilUsable()
       countOutgoing(payload)
-      await mixnetClient.client.rawSend({ payload, recipient, replySurbs })
+      // The worker's rawSend hands the message over and returns at once, so only a stuck worker
+      // can reach this limit.
+      await withTimeout(mixnetClient.client.rawSend({ payload, recipient, replySurbs }), NYM_WORKER_CALL_TIMEOUT_MS, 'handing a message to the Nym client')
     } catch (error) {
       node.counters.sendFailures += 1
       diagnostics.error('nym', 'send failed', { to: redactNymAddress(recipient), bytes: payload.length, nodeState: node.state, error })
@@ -1300,6 +1391,9 @@ async function createNymNode (mode, abortSignal, { gatewayBand = null, rememberF
     try {
       await waitUntilUsable()
       countOutgoing(payload)
+      // Not time-limited: the worker returns the client's own send_reply promise, which can wait
+      // for room in the client's send queue during a large transfer. A stuck worker is caught by
+      // the traffic sampler instead.
       await mixnetClient.client.rawReply({ payload, senderTag })
     } catch (error) {
       node.counters.sendFailures += 1
@@ -1395,6 +1489,7 @@ function getNymNode (mode) {
       } catch (error) {
         if (error?.name === 'AbortError' || attempt >= NYM_CONNECT_ATTEMPTS) throw error
         diagnostics.warn('nym', 'connection attempt ' + attempt + ' of ' + NYM_CONNECT_ATTEMPTS + ' failed; retrying', error)
+        if (error?.name === 'ClientStartError') await new Promise(resolve => setTimeout(resolve, NYM_START_FAILURE_RETRY_MS))
       }
     }
   })().then(node => {
@@ -1886,29 +1981,65 @@ function updateDocumentTitle () {
 }
 
 // Files in a list: name and size, then a Verified mark and a Save button once received.
-function renderFileRows (listElement, files, options = {}) {
-  listElement.replaceChildren(...files.map((file, index) => {
-    const children = [
-      createElement('i', { 'data-lucide': 'file' }),
-      createElement('div', { className: 'file-text' }, [
-        createElement('span', { className: 'file-name', text: file.name, title: file.name }),
-        createElement('span', { className: 'file-size', text: formatBytes(file.size) })
-      ])
-    ]
-    const verified = options.verified?.[index]
-    if (verified === true) children.push(createElement('span', { className: 'verified' }, [createElement('i', { 'data-lucide': 'check' }), 'Verified']))
-    if (verified === false) children.push(createElement('span', { className: 'verified', 'data-tone': 'error' }, [createElement('i', { 'data-lucide': 'circle-alert' }), 'Failed check']))
-    if (options.onSave) {
-      const saved = options.saved?.has(index)
-      const saveButton = createElement('button', { className: 'button button-secondary', type: 'button', 'aria-label': (saved ? 'Save again: ' : 'Save ') + file.name }, [
-        createElement('i', { 'data-lucide': saved ? 'check' : 'download' }),
-        saved ? 'Saved' : 'Save'
-      ])
-      saveButton.addEventListener('click', () => options.onSave(index))
-      children.push(saveButton)
-    }
-    return createElement('li', { className: 'file-row' }, children)
-  }))
+// ---------------------------------------------------------------------------
+// File types, previews and the share sheet
+// ---------------------------------------------------------------------------
+// A received file can be previewed only if its type is on this list, decided from the type the
+// sender declared or, failing that, its extension. Both come from the sender, so the list holds
+// only types the page shows in an <img>, <video>, <audio> or as plain text, where a file cannot
+// run code. SVG, HTML and PDF are left out on purpose: they can carry scripts or links, and a
+// preview is not worth that risk. Files of every type can still be saved.
+const PREVIEW_TYPES_BY_EXTENSION = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', heic: 'image/heic', heif: 'image/heif',
+  mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
+  mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac',
+  txt: 'text/plain', log: 'text/plain', md: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json'
+}
+const PREVIEW_TYPES = new Set(Object.values(PREVIEW_TYPES_BY_EXTENSION))
+const FILE_ICON_BY_PREVIEW_KIND = { image: 'image', video: 'film', audio: 'music', text: 'file-text' }
+// Decoding a very large image can run a phone out of memory, so bigger images get no preview.
+const PREVIEW_IMAGE_MAX_BYTES = 40 * 1000 * 1000
+// Text previews show the start of the file only.
+const PREVIEW_TEXT_MAX_BYTES = 256 * 1024
+// The share sheet (Web Share with files) is offered on touch devices, where it is how a photo or
+// video reaches the photo library; on a desktop, Save already puts the file where it belongs.
+const SHARE_SHEET_SUPPORTED = typeof navigator.share === 'function' && typeof navigator.canShare === 'function' && matchMedia('(pointer: coarse)').matches
+// iPhone and iPad: Share is the only way from the browser into Photos. iPadOS reports itself as
+// a Mac, so a Mac with a touch screen counts as an iPad.
+const IS_APPLE_TOUCH_DEVICE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1)
+
+/** The allow-listed preview type of a file, or null. */
+function previewTypeOf (name, declaredType) {
+  const declared = String(declaredType ?? '').split(';')[0].trim().toLowerCase()
+  if (PREVIEW_TYPES.has(declared)) return declared
+  const extension = String(name ?? '').toLowerCase().match(/\.([a-z0-9]{1,8})$/)?.[1]
+  return (extension && PREVIEW_TYPES_BY_EXTENSION[extension]) || null
+}
+
+/** 'image', 'video', 'audio', 'text' or null for an allow-listed type. */
+function previewKindOf (previewType) {
+  if (!previewType) return null
+  const family = previewType.split('/')[0]
+  return family === 'image' || family === 'video' || family === 'audio' ? family : 'text'
+}
+
+function fileIconName (file) {
+  return FILE_ICON_BY_PREVIEW_KIND[previewKindOf(previewTypeOf(file.name, file.type))] ?? 'file'
+}
+
+function createFileText (file) {
+  return createElement('div', { className: 'file-text' }, [
+    createElement('span', { className: 'file-name', text: file.name, title: file.name }),
+    createElement('span', { className: 'file-size', text: formatBytes(file.size) })
+  ])
+}
+
+/** File rows without actions: the sender's list, and the recipient's list before download. */
+function renderFileRows (listElement, files) {
+  listElement.replaceChildren(...files.map(file => createElement('li', { className: 'file-row' }, [
+    createElement('i', { 'data-lucide': fileIconName(file) }),
+    createFileText(file)
+  ])))
   renderIcons()
 }
 
@@ -2459,7 +2590,7 @@ async function stopSharing ({ notifyRecipients }) {
 function createReceiveSessionState () {
   return {
     link: null, keychain: null, files: null, totalBytes: 0, client: null, torrent: null, node: null, linkStream: null, LinkStream: null,
-    results: null, savedIndexes: new Set(), replyTimer: null, giveUpTimer: null, uiTimer: null, monitorTimer: null, stopSnapshots: null,
+    results: null, savedIndexes: new Set(), previewUrls: new Map(), shareFiles: new Map(), replyTimer: null, giveUpTimer: null, uiTimer: null, monitorTimer: null, stopSnapshots: null,
     recipientId: null, downloading: false, downloadRequested: false, senderOnline: false, retiredLinkIds: new Set(), lateFramesDropped: 0,
     linkGeneration: 0, lastDataAt: 0, stall: null, hellosSent: 0, helloTimer: null, helloStartedAt: 0, helloSentAt: new Map(), roundTrips: [],
     stage: null, stageStartedAt: 0, stageCaption: null, rateMeter: null, downloadStartedAt: 0, token: 0
@@ -2575,6 +2706,7 @@ function hideReceiveNotice () {
 function resetReceiveView () {
   setReceiveHeading('Files for you', '')
   elementById('receive-file-list').replaceChildren()
+  releaseReceivedPreviews()
   elementById('receive-file-summary').textContent = ''
   elementById('receive-mode').textContent = ''
   elementById('stat-received').textContent = '0 B'
@@ -3094,7 +3226,11 @@ async function finishDownload (torrent) {
     setReceiveHeading(allVerified ? 'Ready to save' : 'Do not trust these files', allVerified ? 'Every file was decrypted and matches what the sender shared.' : '')
     renderReceivedFiles()
     if (allVerified) {
-      setReceiveStage('done', { caption: 'Received ' + formatBytes(receiveSession.totalBytes) + ' in ' + formatElapsed(transferSeconds) + '. Save the files before you leave; they exist only in this tab.' })
+      // On iPhone and iPad, Save puts a photo or video in Files; Share is the way into Photos.
+      const photosHint = IS_APPLE_TOUCH_DEVICE && [...receiveSession.shareFiles.values()].some(file => /^(image|video)\//.test(file.type))
+        ? ' To add a photo or video to Photos, use Share, then Save Image or Save Video.'
+        : ''
+      setReceiveStage('done', { caption: 'Received ' + formatBytes(receiveSession.totalBytes) + ' in ' + formatElapsed(transferSeconds) + '. Save the files before you leave; they exist only in this tab.' + photosHint })
     } else {
       setReceiveStage('failed-check')
     }
@@ -3108,12 +3244,185 @@ async function finishDownload (torrent) {
   }
 }
 
+// Object URLs made for previews and thumbnails. They point at decrypted files, so all of them are
+// revoked whenever the receive view is reset (resetReceiveView).
+const receivedPreviewUrls = new Set()
+
+function releaseReceivedPreviews () {
+  for (const url of receivedPreviewUrls) URL.revokeObjectURL(url)
+  receivedPreviewUrls.clear()
+}
+
+/** An object URL for a verified file's preview, typed with its allow-listed type. Made once per file. */
+function previewUrlFor (index, previewType) {
+  const cached = receiveSession.previewUrls.get(index)
+  if (cached) return cached
+  // A new Blob over the same bytes (no copy), so the browser sees only the allow-listed type.
+  const url = URL.createObjectURL(new Blob([receiveSession.results[index].blob], { type: previewType }))
+  receivedPreviewUrls.add(url)
+  receiveSession.previewUrls.set(index, url)
+  return url
+}
+
+/** A File for the share sheet, or null where this device cannot share it. */
+function shareableFileFor (index, previewType) {
+  const result = receiveSession.results[index]
+  if (!SHARE_SHEET_SUPPORTED || !result.verified) return null
+  const description = receiveSession.files[index]
+  try {
+    const file = new File([result.blob], description.name, { type: previewType || description.type || '' })
+    return navigator.canShare({ files: [file] }) ? file : null
+  } catch (error) {
+    return null
+  }
+}
+
+/**
+ * The verified-file list: each row has Save, plus Preview for allow-listed types and Share where
+ * the device offers a share sheet. Files that failed the check can still be saved, but are never
+ * previewed or shared. Rows are built once; later changes update them in place, so a playing
+ * video is never torn down by a Save.
+ */
 function renderReceivedFiles () {
-  renderFileRows(elementById('receive-file-list'), receiveSession.files, {
-    verified: receiveSession.results.map(result => result.verified),
-    saved: receiveSession.savedIndexes,
-    onSave: saveFile
+  receiveSession.shareFiles.clear()
+  const rows = receiveSession.files.map((file, index) => {
+    const result = receiveSession.results[index]
+    const previewType = result.verified ? previewTypeOf(file.name, file.type) : null
+    const previewKind = previewKindOf(previewType)
+    const canPreview = Boolean(previewKind) && !(previewKind === 'image' && result.blob.size > PREVIEW_IMAGE_MAX_BYTES)
+    const fileIcon = createElement('i', { 'data-lucide': FILE_ICON_BY_PREVIEW_KIND[previewKind] ?? 'file' })
+    let leading = fileIcon
+    if (canPreview && previewKind === 'image') {
+      leading = createElement('img', { className: 'file-thumb', alt: '', decoding: 'async', src: previewUrlFor(index, previewType) })
+      // A format this browser cannot decode (HEIC outside Safari, for example) keeps the icon.
+      leading.addEventListener('error', () => { leading.replaceWith(fileIcon); renderIcons() }, { once: true })
+    }
+    const children = [leading, createFileText(file)]
+    children.push(result.verified
+      ? createElement('span', { className: 'verified' }, [createElement('i', { 'data-lucide': 'check' }), 'Verified'])
+      : createElement('span', { className: 'verified', 'data-tone': 'error' }, [createElement('i', { 'data-lucide': 'circle-alert' }), 'Failed check']))
+
+    const actions = createElement('div', { className: 'file-actions' })
+    const previewPanel = createElement('div', { className: 'file-preview hidden', id: 'file-preview-' + index })
+    if (canPreview) {
+      const previewButton = createElement('button', { className: 'button button-secondary', type: 'button', 'aria-expanded': 'false', 'aria-controls': previewPanel.id, 'aria-label': 'Preview ' + file.name }, [
+        createElement('span', { className: 'button-icon' }, [createElement('i', { 'data-lucide': 'eye' })]),
+        'Preview'
+      ])
+      previewButton.addEventListener('click', () => toggleFilePreview(index, previewKind, previewType, previewButton, previewPanel))
+      actions.append(previewButton)
+    }
+    const shareFile = shareableFileFor(index, previewType)
+    if (shareFile) {
+      receiveSession.shareFiles.set(index, shareFile)
+      const shareButton = createElement('button', { className: 'button button-secondary', type: 'button', 'aria-label': 'Share ' + file.name }, [
+        createElement('i', { 'data-lucide': 'share' }),
+        'Share'
+      ])
+      shareButton.addEventListener('click', () => shareReceivedFile(index))
+      actions.append(shareButton)
+    }
+    const saveButton = createElement('button', { className: 'button button-secondary', type: 'button', 'data-save-index': String(index) })
+    saveButton.addEventListener('click', () => saveFile(index))
+    actions.append(saveButton)
+    updateSaveButton(saveButton, index)
+    children.push(actions, previewPanel)
+    return createElement('li', { className: 'file-row' }, children)
   })
+  elementById('receive-file-list').replaceChildren(...rows)
+  renderIcons()
+}
+
+function updateSaveButton (button, index) {
+  const saved = receiveSession.savedIndexes.has(index)
+  const name = receiveSession.files[index].name
+  button.setAttribute('aria-label', (saved ? 'Save again: ' : 'Save ') + name)
+  button.replaceChildren(createElement('i', { 'data-lucide': saved ? 'check' : 'download' }), saved ? 'Saved' : 'Save')
+}
+
+function markFileSaved (index) {
+  receiveSession.savedIndexes.add(index)
+  const button = elementById('receive-file-list').querySelector('[data-save-index="' + index + '"]')
+  if (button) {
+    updateSaveButton(button, index)
+    renderIcons()
+  }
+}
+
+/** Opens or closes a file's preview below its row. The content is built on first open. */
+async function toggleFilePreview (index, previewKind, previewType, button, panel) {
+  const opening = button.getAttribute('aria-expanded') !== 'true'
+  button.setAttribute('aria-expanded', String(opening))
+  setIcon(button.querySelector('.button-icon'), opening ? 'eye-off' : 'eye')
+  if (!opening) {
+    panel.querySelectorAll('video, audio').forEach(media => media.pause())
+    panel.classList.add('hidden')
+    return
+  }
+  panel.classList.remove('hidden')
+  if (panel.dataset.built === 'true') return
+  panel.dataset.built = 'true'
+  const token = receiveSession.token
+  diagnostics.info('receive', 'preview opened', { file: index + 1, kind: previewKind })
+  const content = await buildPreviewContent(index, previewKind, previewType)
+  if (token !== receiveSession.token) return
+  panel.replaceChildren(...content)
+}
+
+function previewUnavailableNote (text) {
+  return createElement('p', { className: 'preview-note', text })
+}
+
+async function buildPreviewContent (index, previewKind, previewType) {
+  const name = receiveSession.files[index].name
+  if (previewKind === 'image' || previewKind === 'video' || previewKind === 'audio') {
+    const attributes = { className: 'preview-' + previewKind, src: previewUrlFor(index, previewType) }
+    if (previewKind === 'image') Object.assign(attributes, { alt: 'Preview of ' + name, decoding: 'async' })
+    else Object.assign(attributes, { controls: '', preload: 'metadata', 'aria-label': 'Preview of ' + name })
+    if (previewKind === 'video') attributes.playsinline = ''
+    const element = createElement(previewKind === 'image' ? 'img' : previewKind, attributes)
+    element.addEventListener('error', () => {
+      const what = previewKind === 'image' ? 'show this image' : 'play this ' + previewKind
+      element.replaceWith(previewUnavailableNote('This browser cannot ' + what + '. Save the file to open it in another app.'))
+    }, { once: true })
+    return [element]
+  }
+  // Text: the start of the file, decoded strictly as UTF-8. Anything that is not text (invalid
+  // UTF-8, or NUL bytes) is not shown.
+  const blob = receiveSession.results[index].blob
+  const bytes = new Uint8Array(await blob.slice(0, PREVIEW_TEXT_MAX_BYTES).arrayBuffer())
+  let text
+  try {
+    // stream: true tolerates a character cut in half at the end of the slice.
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes, { stream: true })
+  } catch (error) {
+    text = null
+  }
+  if (text === null || text.includes('\u0000')) return [previewUnavailableNote('This file does not contain plain text that can be shown here. Save it to open it in another app.')]
+  const content = [createElement('pre', { className: 'preview-text', text, tabindex: '0', 'aria-label': 'Preview of ' + name })]
+  if (blob.size > PREVIEW_TEXT_MAX_BYTES) content.push(previewUnavailableNote('Showing the first ' + formatBytes(PREVIEW_TEXT_MAX_BYTES) + ' of ' + formatBytes(blob.size) + '.'))
+  return content
+}
+
+/** Opens the device's share sheet for a verified file (on a phone: Save Image, Save to Files, apps). */
+async function shareReceivedFile (index) {
+  const file = receiveSession.shareFiles.get(index)
+  if (!file) return
+  const token = receiveSession.token
+  diagnostics.info('receive', 'share requested', { file: index + 1, bytes: file.size })
+  try {
+    await navigator.share({ files: [file] })
+    if (token !== receiveSession.token) return
+    diagnostics.info('receive', 'shared', { file: index + 1 })
+    markFileSaved(index)
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      diagnostics.info('receive', 'share sheet closed without sharing', { file: index + 1 })
+      return
+    }
+    diagnostics.warn('receive', 'share failed', { file: index + 1, error })
+    if (token === receiveSession.token) showReceiveNotice('warning', 'This device could not share the file. Use Save instead.')
+  }
 }
 
 function saveFile (index) {
@@ -3126,8 +3435,7 @@ function saveFile (index) {
   anchor.click()
   anchor.remove()
   setTimeout(() => URL.revokeObjectURL(url), 60000)
-  receiveSession.savedIndexes.add(index)
-  renderReceivedFiles()
+  markFileSaved(index)
 }
 
 async function saveAllFiles () {
@@ -3529,6 +3837,12 @@ if (FAULT_INJECTION_ENABLED) {
       faultInjection.stallConnects = Math.max(0, Number(count) || 0)
       diagnostics.warn('fault', 'the next connects will look stalled', { count: faultInjection.stallConnects })
     },
+    // Makes the next count client starts fail (they ask for a gateway that does not exist), so the
+    // page's response to a failed start (try another gateway at once) can be tested.
+    failStarts (count = 1) {
+      faultInjection.failStarts = Math.max(0, Number(count) || 0)
+      diagnostics.warn('fault', 'the next client starts will fail', { count: faultInjection.failStarts })
+    },
     // Lets failures caused by these controls be remembered like real ones, to test the memory.
     rememberFaultFailures (enabled = true) {
       faultInjection.rememberFaultFailures = Boolean(enabled)
@@ -3550,7 +3864,8 @@ fitSelectToSelection(elementById('network-mode'))
 wireUserInterface()
 updateModeControl()
 renderIcons()
-const gatewayTestRuns = Number.parseInt(new URLSearchParams(location.search).get('gatewaytest') ?? '', 10)
+elementById('diagnostics').classList.toggle('hidden', !DIAGNOSTICS_VISIBLE)
+const gatewayTestRuns = Number.parseInt(PAGE_PARAMETERS.get('gatewaytest') ?? '', 10)
 if (Number.isInteger(gatewayTestRuns) && gatewayTestRuns > 0) {
   // Measurement only: no normal connection, no idle disconnect.
   elementById('diagnostics').open = true

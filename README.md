@@ -24,7 +24,11 @@ The share link carries everything a recipient needs after the `#`: the sender's 
 
 ## Using it
 
-Open the page, drop in files and send the link. The recipient opens the link, or pastes it into the Receive box, and clicks Download; pressing Download before the sender has answered starts the download as soon as it does. The sender sees each recipient in a list, numbered in the order they made contact, with their progress. The Diagnostics panel at the bottom keeps a timestamped log that never contains keys, links, file names or full Nym addresses.
+Open the page, drop in files and send the link. The recipient opens the link, or pastes it into the Receive box, and clicks Download; pressing Download before the sender has answered starts the download as soon as it does. The sender sees each recipient in a list, numbered in the order they made contact, with their progress.
+
+### Received files
+
+Once every file is decrypted and matches its checksum, each one can be saved. Photos, videos, audio and plain text can also be previewed in the page: images (JPEG, PNG, GIF, WebP, AVIF, BMP, and HEIC where the browser supports it, up to 40 MB), MP4, MOV and WebM video, common audio formats, and the first 256 KB of a text file. Only types on that list are shown, and only through image, video, audio or plain-text elements, where a file cannot run code; SVG, HTML and PDF are never previewed. Files that fail the check can be saved but are never previewed. On phones and tablets, Share opens the system share sheet; on an iPhone or iPad that is how a photo or video reaches Photos (Save Image or Save Video), since Save puts it in Files. Previews are released when the recipient leaves the page's receive view.
 
 ### Network mode
 
@@ -43,6 +47,8 @@ A connected tab uses about 0.8 GB of data an hour in Maximum privacy and about 1
 ## Reliability
 
 - If a Nym gateway connection drops and the Nym client does not restore it within 15 seconds, the page starts a new client with the same keys and the same gateway, so the address in a shared link keeps working. Only if that gateway refuses three reconnects does the page move to a new one, and then the sender sees a new link to send.
+- If the Nym client fails to start (for example when the network map it loaded cannot route packets), the page tries another gateway after a 1-second pause instead of waiting out the 8-second stall limit. The Nym SDK only logs such failures, so `build/nym-reply-patch.mjs` passes them to the page.
+- Every call into the Nym client's worker has a time limit (30 seconds to load it, 10 seconds for a start or a send, 3 seconds to stop it, after which it is ended anyway), so a worker that stops answering can never hold a connect, reconnect or mode switch open. A worker that does not answer the page's 10-second traffic reading is replaced.
 - A recipient that receives no data for 20 seconds opens a new link to the sender. If that brings nothing within 15 seconds, or a link closes early, it checks whether the sender is online every 20 seconds and resumes when the sender answers. Pieces already received are kept. On slow paths these waits grow with the measured round trip to the sender (three round trips before a new link, two before a check), up to three minutes, and WebTorrent's own handshake and request timeouts are raised from 25 and 30 seconds to two minutes (`build/webtorrent-latency-patch.mjs`).
 - Recipients repeat their first message to the sender until it answers, because messages through the mixnet can be delayed or lost.
 - While sending or receiving, the page asks the browser to keep the screen awake.
@@ -65,11 +71,11 @@ So the page does three things:
 
 The connect timeline in the log shows where the 4 to 7 seconds go: fetching the gateway list (about 0.5 s), registering with the gateway (about 2 s, the connection that closes twice), loading the network map from the Nym API (about 1 s), then opening and authenticating the working connection (about 1.7 s). Reconnecting to the same gateway skips registration.
 
-The Nym client itself writes a console line for every message it sends, naming the recipient's full Nym address, and for every gateway connection, naming the gateway's host. The page drops that routine output and keeps the client's warnings and errors with addresses, keys and host names replaced by placeholders (`build/nym-reply-patch.mjs`), so nothing copied from the browser console reveals them.
+The Nym client itself writes a console line for every message it sends, naming the recipient's full Nym address, and for every gateway connection, naming the gateway's host. The page drops that routine output and keeps the client's warnings and errors with addresses, keys and host names replaced by placeholders (`build/nym-reply-patch.mjs`), so nothing copied from the browser console reveals them. Any run of 20 or more letters and digits is replaced unless it is made only of capitalised words, such as an error name; in a simulation over 2 million random keys of each size, 1 in 12,000 reply tags and no 32-byte keys had that shape, and full Nym addresses are always replaced.
 
 ## Testing
 
-The Diagnostics panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 96 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
+Opening the page with `?debug=1` shows the Diagnostics panel at the bottom, a timestamped log of the session that never contains keys, links, file names or full Nym addresses. It is hidden otherwise, and also shown with `?faults=1` and `?gatewaytest=N`. The panel logs every step, including how long each control message spent in transit. It also measures what the page actually sends to and receives from its Nym gateway: every 10 seconds it reads how many Sphinx packets and bytes went each way, and logs a `gateway traffic` entry with packets per second, megabits per second and the share of the rate Nym's settings ask for (55 packets per second in Maximum, 96 in Balanced). Windows in which data or control messages crossed the mixnet are logged as `busy` every 10 seconds; quiet windows are logged as `idle` once a minute. Each entry carries the running idle and busy averages, which also appear when a transfer finishes and when a client stops.
 
 Opening the page with `?faults=1` adds test controls in the browser console:
 
@@ -78,6 +84,7 @@ Opening the page with `?faults=1` adds test controls in the browser console:
 - `nymShareFaults.closeGatewaySockets()` closes this page's connection to its Nym gateway.
 - `nymShareFaults.replaceNymClient()` replaces the Nym client immediately.
 - `nymShareFaults.stallConnects(count)` makes the next count connects see no progress from their gateway, so abandoning a stalled connect after 8 seconds can be tested.
+- `nymShareFaults.failStarts(count)` makes the next count client starts fail (they ask for a gateway that does not exist), so moving on after a failed start can be tested.
 - `nymShareFaults.rememberFaultFailures(true)` lets failures caused by these controls be remembered like real ones, and `nymShareFaults.rememberedGatewayFailures()` lists what is remembered, so the 24-hour memory can be tested.
 - `nymShareFaults.hideAcknowledgements(seconds)` makes the health check see no acknowledgements for that long, as on a broken gateway, so the page's gateway move can be tested on a working one.
 
